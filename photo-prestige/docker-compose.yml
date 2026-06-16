@@ -1,0 +1,222 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: photo-prestige-db
+    environment:
+      POSTGRES_DB: photo_prestige
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - photo-prestige-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # RabbitMQ Message Queue
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: photo-prestige-mq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - photo-prestige-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Auth Service
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-auth
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-key-change-in-production}
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Register Service
+  register-service:
+    build:
+      context: ./services/register-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-register
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-key-change-in-production}
+      AUTH_SERVICE_URL: http://auth-service:3001
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    ports:
+      - "3002:3002"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - auth-service
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Target Service
+  target-service:
+    build:
+      context: ./services/target-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-target
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      AUTH_SERVICE_URL: http://auth-service:3001
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      UPLOAD_DIR: /app/uploads
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      - postgres
+      - rabbitmq
+      - auth-service
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Clock Service
+  clock-service:
+    build:
+      context: ./services/clock-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-clock
+    environment:
+      NODE_ENV: development
+      PORT: 3005
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      REGISTER_SERVICE_URL: http://register-service:3002
+    depends_on:
+      - postgres
+      - rabbitmq
+      - register-service
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Score Service (integreert met Imagga)
+  score-service:
+    build:
+      context: ./services/score-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-score
+    environment:
+      NODE_ENV: development
+      PORT: 3006
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      AUTH_SERVICE_URL: http://auth-service:3001
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      IMAGGA_API_KEY: ${IMAGGA_API_KEY}
+      IMAGGA_API_SECRET: ${IMAGGA_API_SECRET}
+      IMAGGA_API_URL: https://api.imagga.com/v2
+    ports:
+      - "3006:3006"
+    depends_on:
+      - postgres
+      - rabbitmq
+      - auth-service
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Mail Service
+  mail-service:
+    build:
+      context: ./services/mail-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-mail
+    environment:
+      NODE_ENV: development
+      PORT: 3004
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      SMTP_HOST: ${SMTP_HOST:-localhost}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-noreply@photo-prestige.local}
+    ports:
+      - "3004:3004"
+    depends_on:
+      - postgres
+      - rabbitmq
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Read Service
+  read-service:
+    build:
+      context: ./services/read-service
+      dockerfile: Dockerfile
+    container_name: photo-prestige-read
+    environment:
+      NODE_ENV: development
+      PORT: 3007
+      DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
+      AUTH_SERVICE_URL: http://auth-service:3001
+    ports:
+      - "3007:3007"
+    depends_on:
+      - postgres
+      - auth-service
+    networks:
+      - photo-prestige-network
+    restart: unless-stopped
+
+  # Optional: MailHog for local email testing
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: photo-prestige-mailhog
+    ports:
+      - "1025:1025"    # SMTP
+      - "8025:8025"    # Web UI
+    networks:
+      - photo-prestige-network
+
+networks:
+  photo-prestige-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
