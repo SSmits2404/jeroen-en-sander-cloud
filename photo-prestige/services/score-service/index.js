@@ -2,7 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
-const cors = require('express-cors');
+const cors = require('cors');
 const morgan = require('morgan');
 const { Pool } = require('pg');
 const amqp = require('amqplib');
