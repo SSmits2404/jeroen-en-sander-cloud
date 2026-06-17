@@ -46,10 +46,10 @@ docker ps
 # Check each service health
 curl http://localhost:3001/auth/health
 curl http://localhost:3002/register/health
-curl http://localhost:3003/targets/health
+curl http://localhost:3003/target/health
 curl http://localhost:3004/mail/health
 curl http://localhost:3005/clock/health
-curl http://localhost:3006/scores/health
+curl http://localhost:3006/score/health
 curl http://localhost:3007/read/health
 
 # Should all return: {"status": "OK", "service": "..."}

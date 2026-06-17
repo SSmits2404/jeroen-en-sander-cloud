@@ -83,8 +83,8 @@ const publishEvent = async (eventName, data) => {
 
 // ==================== ROUTES ====================
 
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', service: 'score-service' });
+app.get('/score/health', (req, res) => {
+    res.json({ status: 'OK', service: 'score-service', timestamp: new Date() });
 });
 
 /**
