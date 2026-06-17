@@ -1,4 +1,3 @@
-// services/register-service/index.js
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -9,6 +8,7 @@ const amqp = require('amqplib');
 const multer = require('multer');
 const { Pool } = require('pg');
 const winston = require('winston');
+const fs = require('fs');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -21,6 +21,12 @@ const logger = winston.createLogger({
 
 const app = express();
 const PORT = process.env.PORT || 3002;
+
+// Zorg ervoor dat de upload map bestaat bij opstarten
+const uploadDir = process.env.UPLOAD_DIR || 'uploads/';
+if (!fs.existsSync(uploadDir)){
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 // Middleware
 app.use(helmet());
@@ -37,7 +43,7 @@ app.use('/register/', limiter);
 
 // File upload configuration
 const upload = multer({
-    dest: process.env.UPLOAD_DIR || 'uploads/',
+    dest: uploadDir,
     limits: {
         fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10485760 // 10MB
     },
@@ -46,7 +52,10 @@ const upload = multer({
         if (allowedMimes.includes(file.mimetype)) {
             cb(null, true);
         } else {
-            cb(new Error('Invalid file type. Only image files are allowed.'));
+            // FIX: Geef een specifieke custom error mee die we beneden netjes kunnen opvangen
+            const err = new Error('Invalid file type. Only image files (JPEG, PNG, GIF, WEBP) are allowed.');
+            err.code = 'INVALID_FILE_TYPE';
+            cb(err);
         }
     }
 });
@@ -56,38 +65,52 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
 
-// RabbitMQ connection
+// RabbitMQ connection with auto-retry
 let channel;
-const initRabbitMQ = async () => {
-    try {
-        const connection = await amqp.connect(process.env.RABBITMQ_URL);
-        channel = await connection.createChannel();
-        logger.info('RabbitMQ connected');
-    } catch (error) {
-        logger.error('RabbitMQ connection failed:', error);
+const initRabbitMQ = async (retries = 5) => {
+    while (retries) {
+        try {
+            const connection = await amqp.connect(process.env.RABBITMQ_URL);
+            channel = await connection.createChannel();
+            await channel.assertExchange('photo-prestige', 'topic', { durable: true });
+            logger.info('RabbitMQ connected (Register Service)');
+            return;
+        } catch (error) {
+            logger.error(`RabbitMQ connection failed for Register Service. Retries left: ${retries - 1}`, error);
+            retries -= 1;
+            await new Promise(res => setTimeout(res, 3000));
+        }
     }
+    logger.error('Register Service kon niet verbinden met RabbitMQ. Events worden niet verzonden!');
 };
 
 // Publish event to queue
 const publishEvent = async (eventName, data) => {
-    if (!channel) return;
+    if (!channel) {
+        logger.warn(`Event ${eventName} niet verzonden: RabbitMQ kanaal onbeschikbaar.`);
+        return;
+    }
     try {
-        await channel.assertExchange('photo-prestige', 'topic', { durable: true });
         channel.publish(
             'photo-prestige',
             eventName,
             Buffer.from(JSON.stringify(data)),
             { persistent: true }
         );
+        logger.info(`Event gepubliceerd: ${eventName}`);
     } catch (error) {
-        logger.error('Event publish failed:', error);
+        logger.error('Event publish failed in register-service:', error);
     }
 };
 
 // ==================== ROUTES ====================
 
-// Health check
+// Health checks
 app.get('/register/health', (req, res) => {
+    res.json({ status: 'OK', service: 'register-service', timestamp: new Date() });
+});
+
+app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'register-service', timestamp: new Date() });
 });
 
@@ -97,11 +120,21 @@ app.post('/register/photo', upload.single('photo'), async (req, res) => {
         const { userId, title, description, tags } = req.body;
 
         if (!userId || !req.file) {
+            // Verwijder geüpload bestand als invoer incompleet is
+            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(400).json({ error: 'Missing required fields: userId and photo file' });
         }
 
-        if (!title) {
+        if (!title || title.trim() === '') {
+            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(400).json({ error: 'Photo title is required' });
+        }
+
+        // Controleer of de user bestaat om database foreign key crashes te voorkomen
+        const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+        if (userCheck.rows.length === 0) {
+            if (req.file) fs.unlinkSync(req.file.path);
+            return res.status(404).json({ error: 'Target user does not exist' });
         }
 
         // Insert photo record
@@ -109,7 +142,7 @@ app.post('/register/photo', upload.single('photo'), async (req, res) => {
             `INSERT INTO photos (user_id, title, description, image_url, file_path, tags, status, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
              RETURNING id, user_id, title, description, image_url, created_at`,
-            [userId, title, description || null, req.file.filename, req.file.path, tags || null, 'pending']
+            [userId, title.trim(), description || null, req.file.filename, req.file.path, tags || null, 'pending']
         );
 
         const photo = result.rows[0];
@@ -136,6 +169,7 @@ app.post('/register/photo', upload.single('photo'), async (req, res) => {
             }
         });
     } catch (error) {
+        if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
         logger.error('Photo registration error:', error);
         res.status(500).json({ error: 'Failed to register photo' });
     }
@@ -147,7 +181,14 @@ app.post('/register/photos/bulk', upload.array('photos', 10), async (req, res) =
         const { userId } = req.body;
 
         if (!userId || !req.files || req.files.length === 0) {
-            return res.status(400).json({ error: 'Missing required fields' });
+            if (req.files) req.files.forEach(f => fs.unlinkSync(f.path));
+            return res.status(400).json({ error: 'Missing required fields: userId and photos array' });
+        }
+
+        const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+        if (userCheck.rows.length === 0) {
+            req.files.forEach(f => fs.unlinkSync(f.path));
+            return res.status(404).json({ error: 'Target user does not exist' });
         }
 
         const photos = [];
@@ -168,6 +209,7 @@ app.post('/register/photos/bulk', upload.array('photos', 10), async (req, res) =
                 photoId: photo.id,
                 userId: photo.user_id,
                 filename: file.filename,
+                title: photo.title,
                 timestamp: new Date()
             });
         }
@@ -179,6 +221,7 @@ app.post('/register/photos/bulk', upload.array('photos', 10), async (req, res) =
             photos: photos
         });
     } catch (error) {
+        if (req.files) req.files.forEach(f => { if (fs.existsSync(f.path)) fs.unlinkSync(f.path); });
         logger.error('Bulk photo registration error:', error);
         res.status(500).json({ error: 'Failed to register photos' });
     }
@@ -192,7 +235,7 @@ app.put('/register/photos/:photoId', async (req, res) => {
 
         // Check if photo exists
         const checkResult = await pool.query(
-            'SELECT id FROM photos WHERE id = $1',
+            'SELECT id, title, description, tags FROM photos WHERE id = $1',
             [photoId]
         );
 
@@ -200,16 +243,23 @@ app.put('/register/photos/:photoId', async (req, res) => {
             return res.status(404).json({ error: 'Photo not found' });
         }
 
+        const currentPhoto = checkResult.rows[0];
+
+        // FIX: Gebruik pure JavaScript fallbacks in plaats van risicovolle SQL COALESCE combinaties
+        const finalTitle = title !== undefined ? title : currentPhoto.title;
+        const finalDescription = description !== undefined ? description : currentPhoto.description;
+        const finalTags = tags !== undefined ? tags : currentPhoto.tags;
+
         // Update photo
         const result = await pool.query(
             `UPDATE photos 
-             SET title = COALESCE($1, title),
-                 description = COALESCE($2, description),
-                 tags = COALESCE($3, tags),
+             SET title = $1,
+                 description = $2,
+                 tags = $3,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $4
              RETURNING id, title, description, tags, updated_at`,
-            [title || null, description || null, tags || null, photoId]
+            [finalTitle, finalDescription, finalTags, photoId]
         );
 
         const photo = result.rows[0];
@@ -271,21 +321,32 @@ app.post('/register/photos/:photoId/publish', async (req, res) => {
     }
 });
 
-// Delete a photo
+// Delete a photo from DB and physical storage
 app.delete('/register/photos/:photoId', async (req, res) => {
     try {
         const { photoId } = req.params;
+
+        // Haal eerst het bestandspad op voor opschoning
+        const fileResult = await pool.query('SELECT file_path FROM photos WHERE id = $1', [photoId]);
+        
+        if (fileResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Photo not found' });
+        }
+
+        const filePath = fileResult.rows[0].file_path;
 
         const result = await pool.query(
             `DELETE FROM photos WHERE id = $1 RETURNING id, title`,
             [photoId]
         );
 
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Photo not found' });
-        }
-
         const photo = result.rows[0];
+
+        // Verwijder het fysieke bestand van de harde schijf (voorkom serververvuiling)
+        if (filePath && fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            logger.info(`Physical file deleted: ${filePath}`);
+        }
 
         // Publish event
         await publishEvent('photo.deleted', {
@@ -294,7 +355,7 @@ app.delete('/register/photos/:photoId', async (req, res) => {
             timestamp: new Date()
         });
 
-        logger.info(`Photo deleted: ${photoId}`);
+        logger.info(`Photo record deleted from database: ${photoId}`);
 
         res.json({
             message: 'Photo deleted successfully'
@@ -307,12 +368,18 @@ app.delete('/register/photos/:photoId', async (req, res) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-    logger.error('Unhandled error:', err);
+    logger.error('Unhandled error in register-service:', err);
     
+    // FIX: Vang ook onze custom 'INVALID_FILE_TYPE' op met een nette 400 response
+    if (err.code === 'INVALID_FILE_TYPE') {
+        return res.status(400).json({ error: err.message });
+    }
+
     if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
-            return res.status(400).json({ error: 'File too large' });
+            return res.status(400).json({ error: 'File too large. Maximum size is 10MB.' });
         }
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
     }
     
     res.status(500).json({ error: 'Internal server error' });

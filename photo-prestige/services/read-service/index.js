@@ -1,6 +1,5 @@
-// services/read-service/index.js
 require('dotenv').config();
-const express = require('express');
+const express = require('express'); // Gecorrigeerd: express import toegevoegd!
 const helmet = require('helmet');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
@@ -19,7 +18,7 @@ const logger = winston.createLogger({
 });
 
 const app = express();
-const PORT = process.env.PORT || 3003;
+const PORT = process.env.PORT || 3007; // Universeel afgestemd op poort 3007 voor read-service
 
 // Middleware
 app.use(helmet());
@@ -39,29 +38,41 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
 
-// RabbitMQ connection
+// RabbitMQ connection with auto-retry
 let channel;
-const initRabbitMQ = async () => {
-    try {
-        const connection = await amqp.connect(process.env.RABBITMQ_URL);
-        channel = await connection.createChannel();
-        logger.info('RabbitMQ connected');
-    } catch (error) {
-        logger.error('RabbitMQ connection failed:', error);
+const initRabbitMQ = async (retries = 5) => {
+    while (retries) {
+        try {
+            const connection = await amqp.connect(process.env.RABBITMQ_URL);
+            channel = await connection.createChannel();
+            await channel.assertExchange('photo-prestige', 'topic', { durable: true });
+            logger.info('RabbitMQ connected (Read Service)');
+            return;
+        } catch (error) {
+            logger.error(`RabbitMQ connection failed for Read Service. Retries left: ${retries - 1}`, error);
+            retries -= 1;
+            await new Promise(res => setTimeout(res, 3000));
+        }
     }
+    logger.warn('Read Service could not connect to RabbitMQ, proceeding in query-only mode.');
 };
 
 // ==================== ROUTES ====================
 
-// Health check
+// Health checks
 app.get('/read/health', (req, res) => {
+    res.json({ status: 'OK', service: 'read-service', timestamp: new Date() });
+});
+
+app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'read-service', timestamp: new Date() });
 });
 
 // Get all users (read-only)
 app.get('/read/users', async (req, res) => {
     try {
-        const { page = 1, limit = 20 } = req.query;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
 
         const result = await pool.query(
@@ -77,8 +88,8 @@ app.get('/read/users', async (req, res) => {
         res.json({
             users: result.rows,
             pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
+                page: page,
+                limit: limit,
                 total: parseInt(countResult.rows[0].count)
             }
         });
@@ -115,7 +126,8 @@ app.get('/read/users/:userId', async (req, res) => {
 app.get('/read/users/:userId/photos', async (req, res) => {
     try {
         const { userId } = req.params;
-        const { page = 1, limit = 20 } = req.query;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
 
         const result = await pool.query(
@@ -135,8 +147,8 @@ app.get('/read/users/:userId/photos', async (req, res) => {
         res.json({
             photos: result.rows,
             pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
+                page: page,
+                limit: limit,
                 total: parseInt(countResult.rows[0].count)
             }
         });
@@ -189,7 +201,10 @@ app.get('/read/photos/:photoId/scores', async (req, res) => {
 
         res.json({
             scores: result.rows,
-            statistics: avgResult.rows[0]
+            statistics: {
+                average_score: parseFloat(avgResult.rows[0].average_score) || 0,
+                total_scores: parseInt(avgResult.rows[0].total_scores) || 0
+            }
         });
     } catch (error) {
         logger.error('Read scores error:', error);
@@ -200,7 +215,7 @@ app.get('/read/photos/:photoId/scores', async (req, res) => {
 // Get leaderboard
 app.get('/read/leaderboard', async (req, res) => {
     try {
-        const { limit = 10 } = req.query;
+        const limit = parseInt(req.query.limit) || 10;
 
         const result = await pool.query(
             `SELECT 
@@ -215,7 +230,7 @@ app.get('/read/leaderboard', async (req, res) => {
              LEFT JOIN photos p ON u.id = p.user_id
              LEFT JOIN scores s ON p.id = s.photo_id
              GROUP BY u.id, u.username, u.first_name, u.last_name
-             ORDER BY average_score DESC, photo_count DESC
+             ORDER BY average_score DESC NULLS LAST, photo_count DESC
              LIMIT $1`,
             [limit]
         );
@@ -230,7 +245,9 @@ app.get('/read/leaderboard', async (req, res) => {
 // Search photos
 app.get('/read/search', async (req, res) => {
     try {
-        const { q, page = 1, limit = 20 } = req.query;
+        const q = req.query.q;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
 
         if (!q) {
             return res.status(400).json({ error: 'Search query required' });
@@ -241,17 +258,17 @@ app.get('/read/search', async (req, res) => {
         const result = await pool.query(
             `SELECT id, title, description, image_url, user_id, created_at 
              FROM photos 
-             WHERE title ILIKE $1 OR description ILIKE $1
+             WHERE title ILIKE $1 OR description ILIKE $2
              ORDER BY created_at DESC 
-             LIMIT $2 OFFSET $3`,
-            [`%${q}%`, limit, offset]
+             LIMIT $3 OFFSET $4`,
+            [`%${q}%`, `%${q}%`, limit, offset]
         );
 
         res.json({
             results: result.rows,
             pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
+                page: page,
+                limit: limit,
                 query: q
             }
         });
@@ -272,7 +289,7 @@ app.get('/read/statistics', async (req, res) => {
             statistics: {
                 total_users: parseInt(userCountResult.rows[0].count),
                 total_photos: parseInt(photoCountResult.rows[0].count),
-                average_photo_score: avgScoreResult.rows[0].avg_score || 0
+                average_photo_score: parseFloat(avgScoreResult.rows[0].avg_score) || 0
             }
         });
     } catch (error) {

@@ -1,4 +1,3 @@
-// services/target-service/index.js
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -39,15 +38,21 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
 
-// RabbitMQ connection
+// RabbitMQ verbinding met automatische retry-lus
 let channel;
-const initRabbitMQ = async () => {
-    try {
-        const connection = await amqp.connect(process.env.RABBITMQ_URL);
-        channel = await connection.createChannel();
-        logger.info('RabbitMQ connected');
-    } catch (error) {
-        logger.error('RabbitMQ connection failed:', error);
+const initRabbitMQ = async (retries = 5) => {
+    while (retries) {
+        try {
+            const connection = await amqp.connect(process.env.RABBITMQ_URL);
+            channel = await connection.createChannel();
+            await channel.assertExchange('photo-prestige', 'topic', { durable: true });
+            logger.info('RabbitMQ connected (Target Service)');
+            return;
+        } catch (error) {
+            logger.error(`RabbitMQ connection failed for Target Service. Retries left: ${retries - 1}`, error);
+            retries -= 1;
+            await new Promise(res => setTimeout(res, 3000));
+        }
     }
 };
 
@@ -55,7 +60,6 @@ const initRabbitMQ = async () => {
 const publishEvent = async (eventName, data) => {
     if (!channel) return;
     try {
-        await channel.assertExchange('photo-prestige', 'topic', { durable: true });
         channel.publish(
             'photo-prestige',
             eventName,
@@ -63,14 +67,18 @@ const publishEvent = async (eventName, data) => {
             { persistent: true }
         );
     } catch (error) {
-        logger.error('Event publish failed:', error);
+        logger.error('Event publish failed in target-service:', error);
     }
 };
 
 // ==================== ROUTES ====================
 
-// Health check
+// Health checks
 app.get('/target/health', (req, res) => {
+    res.json({ status: 'OK', service: 'target-service', timestamp: new Date() });
+});
+
+app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'target-service', timestamp: new Date() });
 });
 
@@ -83,16 +91,21 @@ app.post('/target/goals', async (req, res) => {
             return res.status(400).json({ error: 'Missing required fields: userId and title' });
         }
 
+        // Controleer eerst of de user bestaat
+        const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+        if (userCheck.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
         const result = await pool.query(
             `INSERT INTO targets (user_id, title, description, target_score, target_photo_count, deadline, status, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
              RETURNING id, user_id, title, description, target_score, target_photo_count, deadline, status, created_at`,
-            [userId, title, description || null, targetScore || null, targetPhotoCount || null, deadline || null, 'active']
+            [userId, title.trim(), description || null, targetScore || null, targetPhotoCount || null, deadline || null, 'active']
         );
 
         const goal = result.rows[0];
 
-        // Publish event
         await publishEvent('target.created', {
             targetId: goal.id,
             userId: goal.user_id,
@@ -155,11 +168,11 @@ app.get('/target/goals/:targetId', async (req, res) => {
 
         const target = result.rows[0];
 
-        // Get progress
+        // FIX: Kolomnaam gecorrigeerd naar final_score + cast AVG naar float (voorkomt string-issues)
         const progressResult = await pool.query(
             `SELECT 
-                COUNT(DISTINCT p.id) as photo_count,
-                AVG(s.score) as average_score
+                COUNT(DISTINCT p.id)::int as photo_count,
+                COALESCE(AVG(s.final_score)::float, 0.0) as average_score
              FROM photos p
              LEFT JOIN scores s ON p.id = s.photo_id
              WHERE p.user_id = $1`,
@@ -182,27 +195,37 @@ app.put('/target/goals/:targetId', async (req, res) => {
         const { targetId } = req.params;
         const { title, description, targetScore, targetPhotoCount, deadline, status } = req.body;
 
+        // Haal huidige data op om de COALESCE overschrijf-bug in JS op te lossen
+        const checkResult = await pool.query('SELECT * FROM targets WHERE id = $1', [targetId]);
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Target not found' });
+        }
+        const currentTarget = checkResult.rows[0];
+
+        // FIX: Zuivere JavaScript afhandeling in plaats van onveilige SQL types overschrijven
+        const finalTitle = title !== undefined ? title : currentTarget.title;
+        const finalDescription = description !== undefined ? description : currentTarget.description;
+        const finalTargetScore = targetScore !== undefined ? targetScore : currentTarget.target_score;
+        const finalTargetPhotoCount = targetPhotoCount !== undefined ? targetPhotoCount : currentTarget.target_photo_count;
+        const finalDeadline = deadline !== undefined ? deadline : currentTarget.deadline;
+        const finalStatus = status !== undefined ? status : currentTarget.status;
+
         const result = await pool.query(
             `UPDATE targets 
-             SET title = COALESCE($1, title),
-                 description = COALESCE($2, description),
-                 target_score = COALESCE($3, target_score),
-                 target_photo_count = COALESCE($4, target_photo_count),
-                 deadline = COALESCE($5, deadline),
-                 status = COALESCE($6, status),
+             SET title = $1,
+                 description = $2,
+                 target_score = $3,
+                 target_photo_count = $4,
+                 deadline = $5,
+                 status = $6,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = $7
              RETURNING id, title, description, target_score, target_photo_count, deadline, status, updated_at`,
-            [title || null, description || null, targetScore || null, targetPhotoCount || null, deadline || null, status || null, targetId]
+            [finalTitle, finalDescription, finalTargetScore, finalTargetPhotoCount, finalDeadline, finalStatus, targetId]
         );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({ error: 'Target not found' });
-        }
 
         const target = result.rows[0];
 
-        // Publish event
         await publishEvent('target.updated', {
             targetId: target.id,
             status: target.status,
@@ -226,7 +249,6 @@ app.post('/target/goals/:targetId/complete', async (req, res) => {
     try {
         const { targetId } = req.params;
 
-        // Get target first
         const targetResult = await pool.query(
             `SELECT * FROM targets WHERE id = $1`,
             [targetId]
@@ -238,11 +260,11 @@ app.post('/target/goals/:targetId/complete', async (req, res) => {
 
         const target = targetResult.rows[0];
 
-        // Check if target goals are met
+        // FIX: Gecorrigeerde aggregatie query met floats
         const progressResult = await pool.query(
             `SELECT 
-                COUNT(DISTINCT p.id) as photo_count,
-                AVG(s.score) as average_score
+                COUNT(DISTINCT p.id)::int as photo_count,
+                COALESCE(AVG(s.final_score)::float, 0.0) as average_score
              FROM photos p
              LEFT JOIN scores s ON p.id = s.photo_id
              WHERE p.user_id = $1`,
@@ -281,7 +303,6 @@ app.post('/target/goals/:targetId/complete', async (req, res) => {
 
         const completedTarget = updateResult.rows[0];
 
-        // Publish event
         await publishEvent('target.completed', {
             targetId: completedTarget.id,
             userId: target.user_id,
@@ -317,7 +338,6 @@ app.delete('/target/goals/:targetId', async (req, res) => {
 
         const target = result.rows[0];
 
-        // Publish event
         await publishEvent('target.deleted', {
             targetId: target.id,
             title: target.title,
@@ -351,12 +371,13 @@ app.get('/target/goals/:targetId/progress', async (req, res) => {
 
         const target = targetResult.rows[0];
 
+        // FIX: Kolomnamen en types gecast om JavaScript Rekenfouten (NaN) te elimineren
         const progressResult = await pool.query(
             `SELECT 
-                COUNT(DISTINCT p.id) as photo_count,
-                AVG(s.score) as average_score,
-                MAX(s.score) as highest_score,
-                MIN(s.score) as lowest_score
+                COUNT(DISTINCT p.id)::int as photo_count,
+                COALESCE(AVG(s.final_score)::float, 0.0) as average_score,
+                COALESCE(MAX(s.final_score)::float, 0.0) as highest_score,
+                COALESCE(MIN(s.final_score)::float, 0.0) as lowest_score
              FROM photos p
              LEFT JOIN scores s ON p.id = s.photo_id
              WHERE p.user_id = $1`,
@@ -365,9 +386,10 @@ app.get('/target/goals/:targetId/progress', async (req, res) => {
 
         const progress = progressResult.rows[0];
 
+        // FIX: Beveiliging tegen delen door nul of null waarden
         const completion = {
             photoCount: target.target_photo_count ? Math.round((progress.photo_count / target.target_photo_count) * 100) : null,
-            averageScore: target.target_score ? Math.round((progress.average_score / target.target_score) * 100) : null
+            averageScore: target.target_score && progress.average_score ? Math.round((progress.average_score / target.target_score) * 100) : (target.target_score ? 0 : null)
         };
 
         res.json({
@@ -383,7 +405,7 @@ app.get('/target/goals/:targetId/progress', async (req, res) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-    logger.error('Unhandled error:', err);
+    logger.error('Unhandled error in target-service:', err);
     res.status(500).json({ error: 'Internal server error' });
 });
 

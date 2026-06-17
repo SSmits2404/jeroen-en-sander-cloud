@@ -1,4 +1,3 @@
-// services/clock-service/index.js
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -32,38 +31,65 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
 
-// RabbitMQ connection
+// RabbitMQ connection with auto-retry
 let channel;
-const initRabbitMQ = async () => {
-    try {
-        const connection = await amqp.connect(process.env.RABBITMQ_URL);
-        channel = await connection.createChannel();
-        logger.info('RabbitMQ connected');
-    } catch (error) {
-        logger.error('RabbitMQ connection failed:', error);
+const initRabbitMQ = async (retries = 5) => {
+    while (retries) {
+        try {
+            const connection = await amqp.connect(process.env.RABBITMQ_URL);
+            channel = await connection.createChannel();
+            await channel.assertExchange('photo-prestige', 'topic', { durable: true });
+            logger.info('RabbitMQ connected and exchange asserted (Clock Service)');
+            return;
+        } catch (error) {
+            logger.error(`RabbitMQ connection failed. Retries left: ${retries - 1}`, error);
+            retries -= 1;
+            await new Promise(res => setTimeout(res, 3000));
+        }
     }
+    logger.error('Clock service could not connect to RabbitMQ, tasks will log but cannot dispatch events.');
 };
 
 // Publish event to queue
 const publishEvent = async (eventName, data) => {
-    if (!channel) return;
+    if (!channel) {
+        logger.warn(`Event ${eventName} skipped: No RabbitMQ channel.`);
+        return;
+    }
     try {
-        await channel.assertExchange('photo-prestige', 'topic', { durable: true });
         channel.publish(
             'photo-prestige',
             eventName,
             Buffer.from(JSON.stringify(data)),
             { persistent: true }
         );
+        logger.info(`Event published by Clock: ${eventName}`);
     } catch (error) {
-        logger.error('Event publish failed:', error);
+        logger.error('Event publish failed from clock:', error);
+    }
+};
+
+// Helper function to verify if a table exists before querying it
+const tableExists = async (tableName) => {
+    try {
+        const res = await pool.query(
+            `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1);`,
+            [tableName]
+        );
+        return res.rows[0].exists;
+    } catch (e) {
+        return false;
     }
 };
 
 // ==================== ROUTES ====================
 
-// Health check
+// Health checks
 app.get('/clock/health', (req, res) => {
+    res.json({ status: 'OK', service: 'clock-service', timestamp: new Date() });
+});
+
+app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'clock-service', timestamp: new Date() });
 });
 
@@ -87,44 +113,65 @@ app.use((err, req, res, next) => {
 
 // ==================== SCHEDULED TASKS ====================
 
-// Hourly cleanup task - remove expired sessions
+// Hourly cleanup task - remove expired sessions (With fallback if table doesn't exist yet)
 cron.schedule('0 * * * *', async () => {
     try {
         logger.info('Running hourly cleanup task');
         
-        const result = await pool.query(
-            `DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP`
-        );
+        const hasSessions = await tableExists('sessions');
+        let rowCount = 0;
+
+        if (hasSessions) {
+            const result = await pool.query(`DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP`);
+            rowCount = result.rowCount;
+        } else {
+            logger.warn('Table "sessions" does not exist. Skipping physical deletion.');
+        }
         
         await publishEvent('cleanup.completed', {
             task: 'session-cleanup',
-            deletedCount: result.rowCount,
+            deletedCount: rowCount,
             timestamp: new Date()
         });
         
-        logger.info(`Cleaned up ${result.rowCount} expired sessions`);
+        logger.info(`Cleaned up ${rowCount} expired sessions`);
     } catch (error) {
         logger.error('Hourly cleanup error:', error);
     }
 });
 
-// Daily report generation at 2 AM
+// Daily report generation at 2 AM (Safe query fallback to 'users' and 'photos')
 cron.schedule('0 2 * * *', async () => {
     try {
         logger.info('Generating daily report');
+        let statsData = { total_users: 0, active_users: 0, latest_activity: new Date() };
         
-        const stats = await pool.query(`
-            SELECT 
-                COUNT(*) as total_users,
-                COUNT(DISTINCT user_id) as active_users,
-                MAX(created_at) as latest_activity
-            FROM user_activities
-            WHERE created_at >= CURRENT_DATE
-        `);
+        const hasActivities = await tableExists('user_activities');
+        
+        if (hasActivities) {
+            const stats = await pool.query(`
+                SELECT 
+                    COUNT(*) as total_users,
+                    COUNT(DISTINCT user_id) as active_users,
+                    MAX(created_at) as latest_activity
+                FROM user_activities
+                WHERE created_at >= CURRENT_DATE
+            `);
+            statsData = stats.rows[0];
+        } else {
+            // Fallback op tabellen waarvan we zeker weten dat ze bestaan uit de database-inspectie
+            const fallbackStats = await pool.query(`
+                SELECT 
+                    (SELECT COUNT(*) FROM users) as total_users,
+                    (SELECT COUNT(DISTINCT user_id) FROM photos) as active_users,
+                    CURRENT_TIMESTAMP as latest_activity
+            `);
+            statsData = fallbackStats.rows[0];
+        }
         
         await publishEvent('report.generated', {
             type: 'daily',
-            stats: stats.rows[0],
+            stats: statsData,
             timestamp: new Date()
         });
         
@@ -138,19 +185,35 @@ cron.schedule('0 2 * * *', async () => {
 cron.schedule('0 3 * * 0', async () => {
     try {
         logger.info('Calculating weekly statistics');
+        let statsData = { unique_users: 0, total_activities: 0, avg_session_duration: 0 };
         
-        const stats = await pool.query(`
-            SELECT 
-                COUNT(DISTINCT user_id) as unique_users,
-                COUNT(*) as total_activities,
-                AVG(duration) as avg_session_duration
-            FROM user_activities
-            WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
-        `);
+        const hasActivities = await tableExists('user_activities');
+        
+        if (hasActivities) {
+            const stats = await pool.query(`
+                SELECT 
+                    COUNT(DISTINCT user_id) as unique_users,
+                    COUNT(*) as total_activities,
+                    AVG(duration) as avg_session_duration
+                FROM user_activities
+                WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+            `);
+            statsData = stats.rows[0];
+        } else {
+            const fallbackStats = await pool.query(`
+                SELECT 
+                    COUNT(DISTINCT user_id) as unique_users,
+                    COUNT(*) as total_activities,
+                    0 as avg_session_duration
+                FROM photos
+                WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
+            `);
+            statsData = fallbackStats.rows[0];
+        }
         
         await publishEvent('statistics.calculated', {
             period: 'weekly',
-            stats: stats.rows[0],
+            stats: statsData,
             timestamp: new Date()
         });
         
@@ -171,7 +234,7 @@ const startServer = async () => {
 
         app.listen(PORT, () => {
             logger.info(`Clock Service running on port ${PORT}`);
-            logger.info('Scheduled tasks initialized');
+            logger.info('Scheduled tasks initialized safely');
         });
     } catch (error) {
         logger.error('Server startup error:', error);

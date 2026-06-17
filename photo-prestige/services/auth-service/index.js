@@ -1,4 +1,3 @@
-// services/auth-service/index.js
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -41,29 +40,39 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
 
-// RabbitMQ connection
+// RabbitMQ connection with auto-retry
 let channel;
-const initRabbitMQ = async () => {
-    try {
-        const connection = await amqp.connect(process.env.RABBITMQ_URL);
-        channel = await connection.createChannel();
-        logger.info('RabbitMQ connected');
-    } catch (error) {
-        logger.error('RabbitMQ connection failed:', error);
+const initRabbitMQ = async (retries = 5) => {
+    while (retries) {
+        try {
+            const connection = await amqp.connect(process.env.RABBITMQ_URL);
+            channel = await connection.createChannel();
+            await channel.assertExchange('photo-prestige', 'topic', { durable: true });
+            logger.info('RabbitMQ connected and exchange asserted');
+            return;
+        } catch (error) {
+            logger.error(`RabbitMQ connection failed. Retries left: ${retries - 1}`, error);
+            retries -= 1;
+            await new Promise(res => setTimeout(res, 3000)); // Wacht 3 seconden voor de volgende poging
+        }
     }
+    logger.error('Could not connect to RabbitMQ, proceeding without event publishing capability.');
 };
 
 // Emit event to queue
 const publishEvent = async (eventName, data) => {
-    if (!channel) return;
+    if (!channel) {
+        logger.warn(`Event ${eventName} not published: RabbitMQ channel not available.`);
+        return;
+    }
     try {
-        await channel.assertExchange('photo-prestige', 'topic', { durable: true });
         channel.publish(
             'photo-prestige',
             eventName,
             Buffer.from(JSON.stringify(data)),
             { persistent: true }
         );
+        logger.info(`Event published: ${eventName}`);
     } catch (error) {
         logger.error('Event publish failed:', error);
     }
@@ -71,8 +80,12 @@ const publishEvent = async (eventName, data) => {
 
 // ==================== ROUTES ====================
 
-// Health check
+// Health checks (Both for internal Docker orchestration and gateway routing)
 app.get('/auth/health', (req, res) => {
+    res.json({ status: 'OK', service: 'auth-service', timestamp: new Date() });
+});
+
+app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'auth-service', timestamp: new Date() });
 });
 
@@ -90,12 +103,12 @@ app.post('/auth/register', async (req, res) => {
         const saltRounds = parseInt(process.env.BCRYPT_ROUNDS) || 10;
         const passwordHash = await bcryptjs.hash(password, saltRounds);
 
-        // Insert user
+        // Insert user - Explicite 'active' status toegevoegd om 403 login blokkades te voorkomen
         const result = await pool.query(
-            `INSERT INTO users (username, email, password_hash, first_name, last_name, role)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING id, username, email, role, created_at`,
-            [username, email, passwordHash, firstName || null, lastName || null, role || 'participant']
+            `INSERT INTO users (username, email, password_hash, first_name, last_name, role, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id, username, email, role, status, created_at`,
+            [username, email, passwordHash, firstName || null, lastName || null, role || 'participant', 'active']
         );
 
         const user = result.rows[0];
@@ -108,7 +121,7 @@ app.post('/auth/register', async (req, res) => {
             timestamp: new Date()
         });
 
-        logger.info(`User registered: ${user.id}`);
+        logger.info(`User registered successfully: ${user.id}`);
         res.status(201).json({ message: 'User registered successfully', user });
     } catch (error) {
         logger.error('Registration error:', error);
@@ -148,7 +161,7 @@ app.post('/auth/login', async (req, res) => {
 
         // Check if user is active
         if (user.status !== 'active') {
-            return res.status(403).json({ error: 'User account is not active' });
+            return res.status(403).json({ error: `User account is not active (status: ${user.status || 'unknown'})` });
         }
 
         // Generate JWT

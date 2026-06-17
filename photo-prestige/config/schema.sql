@@ -1,6 +1,6 @@
 -- Photo Prestige Database Schema
 -- Microservices architecture with central PostgreSQL
--- Gecorrigeerd voor Target-Service & Read-Service compatibiliteit
+-- Gecorrigeerd voor Target-Service, Read-Service & Performance compatibiliteit
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -39,12 +39,10 @@ CREATE INDEX idx_users_coordinates ON users USING GIST (coordinates);
 -- ============================================
 -- 2. COMPETITIONS / TARGETS TABLE
 -- ============================================
--- Gecorrigeerd: De target-service vereist de tabelnaam "targets".
--- Om de rest van het database-ontwerp intact te laten, is de tabel hernoemd naar targets.
 CREATE TABLE targets (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    target_owner_id UUID REFERENCES users(id) ON DELETE CASCADE, -- Optioneel gemaakt voor target-service flexibiliteit
-    user_id UUID, -- Toegevoegd voor target-service (POST /target/goals)
+    target_owner_id UUID REFERENCES users(id) ON DELETE CASCADE, 
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL, -- Toegevoegd voor target-service link
     title VARCHAR(255) NOT NULL,
     description TEXT,
     location_name VARCHAR(255) DEFAULT 'Unknown Location',
@@ -52,19 +50,19 @@ CREATE TABLE targets (
     search_radius_meters INT DEFAULT 100,
     target_image_url VARCHAR(2048),
     target_image_path VARCHAR(2048),
-    target_score INT DEFAULT 0, -- Toegevoegd voor target-service
-    target_photo_count INT DEFAULT 1, -- Toegevoegd voor target-service
+    target_score INT DEFAULT 0, 
+    target_photo_count INT DEFAULT 1, 
     start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     end_time TIMESTAMP,
-    deadline TIMESTAMP, -- Toegevoegd voor target-service
-    status VARCHAR(50) DEFAULT 'active', -- Standaard op 'active' gezet voor target-service
+    deadline TIMESTAMP, 
+    status VARCHAR(50) DEFAULT 'active', 
     prize_description TEXT,
     min_similarity_score INT DEFAULT 70,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Backward compatibility link (Zorgt dat queries naar 'competitions' ook blijven werken)
+-- Backward compatibility link
 CREATE OR REPLACE VIEW competitions AS SELECT * FROM targets;
 
 -- Indexes for targets
@@ -74,32 +72,32 @@ CREATE INDEX idx_competitions_coordinates ON targets USING GIST (coordinates);
 -- ============================================
 -- 3. PHOTOS / SUBMISSIONS TABLE (Participant Uploads)
 -- ============================================
--- Gecorrigeerd: De read-service en register-service eisen de tabelnaam "photos".
 CREATE TABLE photos (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     competition_id UUID REFERENCES targets(id) ON DELETE CASCADE,
     participant_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    user_id UUID, -- Toegevoegd voor register-service (POST /register/photo)
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE, -- Expliciete foreign key link
     title VARCHAR(255) NOT NULL,
     description TEXT,
     image_url VARCHAR(2048),
     image_path VARCHAR(2048),
-    file_path VARCHAR(2048), -- Toegevoegd voor register-service multer upload
-    tags TEXT, -- Toegevoegd voor register-service metadata
-    coordinates POINT,  -- Camera position where photo was taken
+    file_path VARCHAR(2048), 
+    tags TEXT, 
+    coordinates POINT,  
     taken_at TIMESTAMP,
     uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    status VARCHAR(50) DEFAULT 'pending', -- Standaard op 'pending' gezet voor register/read-service
-    submission_time_seconds INT,  -- Time from competition start to submission
-    imagga_image_id VARCHAR(255),  -- Reference to Imagga indexed image
+    status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'scored', 'rejected'
+    submission_time_seconds INT,  
+    imagga_image_id VARCHAR(255),  
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Backward compatibility link (Zorgt dat queries naar 'submissions' ook blijven werken)
+-- Backward compatibility link
 CREATE OR REPLACE VIEW submissions AS SELECT * FROM photos;
 
 -- Indexes for photos
+CREATE INDEX idx_photos_competition_id ON photos(competition_id); -- CRITIEK VOOR JOINS
 CREATE INDEX idx_submissions_participant_id ON photos(participant_id);
 CREATE INDEX idx_submissions_status ON photos(status);
 CREATE INDEX idx_submissions_uploaded_at ON photos(uploaded_at);
@@ -111,15 +109,15 @@ CREATE TABLE scores (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     competition_id UUID REFERENCES targets(id) ON DELETE CASCADE,
     submission_id UUID REFERENCES photos(id) ON DELETE CASCADE,
-    photo_id UUID, -- Toegevoegd voor de leaderboard-query in de read-service
+    photo_id UUID REFERENCES photos(id) ON DELETE CASCADE, -- FIX: Constraint toegevoegd tegen orphans
     participant_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    similarity_percentage NUMERIC(5,2),  -- 0-100
-    matching_images JSONB,  -- Imagga response with matched image IDs
-    distance_score NUMERIC(5,2),  -- Imagga distance metric
+    similarity_percentage NUMERIC(5,2),  
+    matching_images JSONB,  
+    distance_score NUMERIC(5,2),  
     calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    score INT DEFAULT 0, -- Toegevoegd voor de statistics-query in de read-service
-    final_score NUMERIC(10,2),  -- Combined score (time + similarity)
-    score_formula VARCHAR(255),  -- Formula used for calculation
+    score INT DEFAULT 0, 
+    final_score NUMERIC(10,2),  
+    score_formula VARCHAR(255),  
     is_winner BOOLEAN DEFAULT FALSE,
     winner_rank INT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -127,7 +125,9 @@ CREATE TABLE scores (
 );
 
 -- Indexes for scores
+CREATE INDEX idx_scores_competition_id ON scores(competition_id); -- SNELLE LEADERBOARDS
 CREATE INDEX idx_scores_submission_id ON scores(submission_id);
+CREATE INDEX idx_scores_photo_id ON scores(photo_id);
 CREATE INDEX idx_scores_participant_id ON scores(participant_id);
 CREATE INDEX idx_scores_final_score ON scores(final_score DESC);
 
@@ -245,18 +245,19 @@ CREATE TRIGGER update_submissions_updated_at BEFORE UPDATE ON photos FOR EACH RO
 CREATE TRIGGER update_imagga_mappings_updated_at BEFORE UPDATE ON imagga_index_mappings FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================
--- VIEWS (Aangepast voor tabelnaam-swaps)
+-- VIEWS (Gecorrigeerd voor runtime statussen)
 -- ============================================
 
 CREATE OR REPLACE VIEW active_competitions AS
 SELECT c.*,
        u.username as owner_username,
-       COUNT(cp.participant_id) as participant_count,
-       COUNT(s.id) as submission_count
+       COUNT(DISTINCT cp.participant_id) as participant_count,
+       COUNT(DISTINCT s.id) as submission_count
 FROM targets c
 LEFT JOIN users u ON c.target_owner_id = u.id
 LEFT JOIN competition_participants cp ON c.id = cp.competition_id AND cp.status = 'active'
-LEFT JOIN photos s ON c.id = s.competition_id AND s.status = 'submitted'
+-- FIX: Match op statussen die daadwerkelijk in de applicatie voorkomen ('pending' en 'scored')
+LEFT JOIN photos s ON c.id = s.competition_id AND s.status IN ('pending', 'scored')
 WHERE c.status = 'active' AND (c.end_time > CURRENT_TIMESTAMP OR c.end_time IS NULL)
 GROUP BY c.id, u.id;
 

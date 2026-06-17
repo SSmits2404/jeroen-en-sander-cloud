@@ -18,7 +18,7 @@ services:
       - photo-prestige-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
 
@@ -38,7 +38,7 @@ services:
       - photo-prestige-network
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
 
@@ -57,8 +57,10 @@ services:
     ports:
       - "3001:3001"
     depends_on:
-      - postgres
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     networks:
       - photo-prestige-network
     restart: unless-stopped
@@ -76,12 +78,18 @@ services:
       JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-key-change-in-production}
       AUTH_SERVICE_URL: http://auth-service:3001
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      UPLOAD_DIR: /app/uploads
     ports:
       - "3002:3002"
+    volumes:
+      - ./uploads:/app/uploads 
     depends_on:
-      - postgres
-      - rabbitmq
-      - auth-service
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
     networks:
       - photo-prestige-network
     restart: unless-stopped
@@ -104,9 +112,12 @@ services:
     volumes:
       - ./uploads:/app/uploads
     depends_on:
-      - postgres
-      - rabbitmq
-      - auth-service  
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
     networks:
       - photo-prestige-network
     restart: unless-stopped
@@ -124,7 +135,7 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       REGISTER_SERVICE_URL: http://register-service:3002
     ports:
-      - "3005:3005"  # <--- Dit zorgt ervoor dat je er nu bij kunt via localhost:3005!
+      - "3005:3005"
     depends_on:
       postgres:
         condition: service_healthy
@@ -154,9 +165,12 @@ services:
     ports:
       - "3006:3006"
     depends_on:
-      - postgres
-      - rabbitmq
-      - auth-service
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
     networks:
       - photo-prestige-network
     restart: unless-stopped
@@ -172,11 +186,11 @@ services:
       PORT: 3004
       DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
-      SMTP_HOST: ${SMTP_HOST:-localhost}
-      SMTP_PORT: ${SMTP_PORT:-1025}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASS: ${SMTP_PASS:-}
-      MAIL_FROM: ${MAIL_FROM:-noreply@photo-prestige.local}
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_USER: ""
+      SMTP_PASS: ""
+      MAIL_FROM: noreply@photo-prestige.local
     ports:
       - "3004:3004"
     depends_on:
@@ -184,6 +198,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      mailhog:
+        condition: service_started
     networks:
       - photo-prestige-network
     restart: unless-stopped
@@ -199,6 +215,7 @@ services:
       PORT: 3007
       DATABASE_URL: postgresql://postgres:postgres123@postgres:5432/photo_prestige
       AUTH_SERVICE_URL: http://auth-service:3001
+      RABBITMQ_URL: amqp://rabbitmq:5672
     ports:
       - "3007:3007"
     depends_on:
@@ -210,7 +227,7 @@ services:
       - photo-prestige-network
     restart: unless-stopped
 
-  # Optional: MailHog for local email testing
+  # MailHog for local email testing
   mailhog:
     image: mailhog/mailhog:latest
     container_name: photo-prestige-mailhog

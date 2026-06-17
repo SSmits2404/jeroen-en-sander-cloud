@@ -3,10 +3,10 @@
 ## Quick Start Guide
 
 ### Prerequisites
-- Docker & Docker Compose installed
-- Node.js 18+ (for local development)
-- Imagga account (free signup)
-- Postman or Insomnia (for API testing)
+- Docker & Docker Compose geïnstalleerd
+- Node.js 18+ (voor lokale ontwikkeling buiten Docker)
+- Imagga account (gratis registratie)
+- Postman of Insomnia (voor API testing)
 
 ### Step 1: Clone and Setup
 
@@ -23,20 +23,20 @@ cp .env.example .env
 4. Add to `.env`:
 
 ```env
-IMAGGA_API_KEY=your_api_key
-IMAGGA_API_SECRET=your_api_secret
+IMAGGA_API_KEY=your_real_api_key_here
+IMAGGA_API_SECRET=your_real_api_secret_here
 ```
 
 ### Step 3: Start Services
 
 ```bash
-# Start all services with Docker Compose
-docker-compose up -d
+# Bouw en start alle microservices synchroon op met Docker Compose
+docker-compose up -d --build
 
-# View logs
+# Bekijk de gecentraliseerde logs live
 docker-compose logs -f
 
-# Check services are running
+# Controleer of alle containers de status 'healthy' of 'running' hebben
 docker ps
 ```
 
@@ -44,15 +44,17 @@ docker ps
 
 ```bash
 # Check each service health
-curl http://localhost:3001/auth/health
-curl http://localhost:3002/register/health
-curl http://localhost:3003/target/health
-curl http://localhost:3004/mail/health
-curl http://localhost:3005/clock/health
-curl http://localhost:3006/score/health
-curl http://localhost:3007/read/health
+# Controleer de gezondheid van elke microservice via de universele root routes
+curl http://localhost:3001/health  # Auth Service
+curl http://localhost:3002/health  # Register Service
+curl http://localhost:3003/health  # Target Service
+curl http://localhost:3004/health  # Mail Service
+curl http://localhost:3005/health  # Clock Service
+curl http://localhost:3006/health  # Score Service
+curl http://localhost:3007/health  # Read Service
 
-# Should all return: {"status": "OK", "service": "..."}
+# Elke curl hoort netjes terug te geven: {"status": "OK", "service": "..."}
+
 ```
 
 ## Testing with Postman
@@ -64,24 +66,29 @@ See [postman/Photo-Prestige.postman_collection.json](../postman/Photo-Prestige.p
 
 1. **Register User**
    ```
-   POST /auth/register
+   POST http://localhost:3001/auth/register
+   Content-Type: application/json
+
    {
-     "username": "test_user",
-     "email": "test@example.com",
-     "password": "test123",
-     "role": "participant"
+   "username": "test_user",
+   "email": "test@example.com",
+   "password": "test123",
+   "role": "participant"
    }
    ```
 
 2. **Login**
    ```
-   POST /auth/login
+   POST http://localhost:3001/auth/login
+   Content-Type: application/json
+
    {
-     "email": "test@example.com",
-     "password": "test123"
+   "email": "test@example.com",
+   "password": "test123"
    }
    Response contains JWT token - copy it!
    ```
+   
 
 3. **Set Token in Postman**
    - In Postman: `Manage Environments` → Create/Edit environment
@@ -91,20 +98,34 @@ See [postman/Photo-Prestige.postman_collection.json](../postman/Photo-Prestige.p
    ```
    First register as: role: "target_owner"
    
-   POST /targets/upload
-   - Select a photo file
-   - Add metadata
+   POST http://localhost:3003/target/goals
+   Authorization: Bearer <token>
+   Content-Type: application/json
+
+   {
+   "userId": "JOUW_GEBRUIKERS_UUID",
+   "title": "Grote Kerk Breda",
+   "description": "Fotografeer de kerktoren vanaf de Grote Markt",
+   "targetScore": 85,
+   "targetPhotoCount": 1,
+   "deadline": "2026-12-31T23:59:59.000Z"
+   }
    ```
 
 5. **Get Active Competitions**
    ```
-   GET /read/competitions/active
+   GET http://localhost:3003/target/users/:userId/goals?status=active
    ```
 
 6. **Submit Participation Photo**
    ```
-   POST /submissions/upload
-   - Select a photo file
+   POST http://localhost:3002/register/photo
+      Authorization: Bearer <token>
+      -- Verstuur dit als 'form-data' vanwege de Multer bestandsupload --
+      Key: photo (Selecteer bestand)
+      Key: title (String)
+      Key: userId (String/UUID)
+      Key: competitionId (String/UUID)
    ```
 
 ## Local Development (without Docker)
@@ -119,8 +140,8 @@ docker run -d \
   -p 5432:5432 \
   postgres:15-alpine
 
-# Run schema
-psql -U postgres -d photo_prestige -f config/schema.sql
+# Sla het gecorrigeerde schema op in de database
+psql -U postgres -d photo_prestige -h localhost -f config/schema.sql
 ```
 
 ### Terminal 2: RabbitMQ
@@ -150,18 +171,17 @@ psql -U postgres -d photo_prestige -h localhost
 
 ### Useful Queries
 ```sql
--- List all users
-SELECT id, username, email, role FROM users;
+-- Bekijk alle geregistreerde gebruikers en hun rollen
+SELECT id, username, email, role, status FROM users;
 
--- List active competitions
-SELECT * FROM competitions WHERE status = 'active';
+-- Bekijk alle actieve competities via de gecorrigeerde view
+SELECT * FROM active_competitions;
 
--- View leaderboard for competition
-SELECT u.username, s.similarity_percentage, s.final_score
-FROM scores s
-JOIN users u ON s.participant_id = u.id
-WHERE s.competition_id = 'COMP_ID'
-ORDER BY s.final_score DESC;
+-- Bekijk het realtime klassement voor een specifieke competitie
+SELECT username, final_score, similarity_percentage, winner_rank 
+FROM competition_leaderboard 
+WHERE competition_id = 'COMP_ID_HIER'
+ORDER BY final_score DESC;
 ```
 
 ## RabbitMQ Management UI
