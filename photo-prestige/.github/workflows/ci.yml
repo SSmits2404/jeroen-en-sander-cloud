@@ -28,8 +28,10 @@ jobs:
 
     - name: Run Target Service Unittests
       run: |
-        cd services/target-service
+        cd photo-prestige/services/target-service
+        npm install
         npm test
+
 
   test-score-service:
     name: Test Score Service
@@ -49,7 +51,9 @@ jobs:
         cd services/score-service
         npm install
 
+   
     - name: Run Score Service Unittests
       run: |
-        cd services/score-service
+        cd photo-prestige/services/score-service
+        npm install
         npm test
