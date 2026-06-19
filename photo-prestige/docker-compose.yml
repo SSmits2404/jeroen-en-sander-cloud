@@ -237,6 +237,28 @@ services:
     networks:
       - photo-prestige-network
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: photo-prestige-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - photo-prestige-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: photo-prestige-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - photo-prestige-network
+    depends_on:
+      - prometheus
+
 networks:
   photo-prestige-network:
     driver: bridge
@@ -244,3 +266,4 @@ networks:
 volumes:
   postgres_data:
   rabbitmq_data:
+
