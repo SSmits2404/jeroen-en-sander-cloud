@@ -38,7 +38,7 @@ jobs:
 
     steps:
     - name: Code ophalen uit GitHub
-      uses: actions/actions/checkout@v4
+      uses: actions/checkout@v4
 
     - name: Node.js opzetten
       uses: actions/setup-node@v4
