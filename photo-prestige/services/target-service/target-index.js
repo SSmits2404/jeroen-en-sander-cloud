@@ -7,6 +7,8 @@ const morgan = require('morgan');
 const amqp = require('amqplib');
 const { Pool } = require('pg');
 const winston = require('winston');
+const createBreaker = require('./shared/circuitBreaker'); 
+const axios = require('axios');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -43,9 +45,6 @@ const PORT = process.env.PORT || 3003; // We zetten deze nu ook hard op 3003 zod
 
 // ==================== CIRCUIT BREAKER CONFIG ====================
 
-const createBreaker = require('./shared/circuitBreaker'); // Pad aanpassen naar waar je bestand staat
-const axios = require('axios');
-
 // 1. Definieer de specifieke call voor deze service
 const callScoreService = async (data) => {
     return await axios.post('http://score-service:3006/scores/calculate', data);
@@ -56,7 +55,11 @@ const breaker = createBreaker(callScoreService);
 
 // 3. Fallback definiëren (specifiek per service)
 breaker.fallback((error) => {
-    return { data: { error: 'Service is momenteel niet beschikbaar.' } };
+    logger.warn('Circuit Breaker Geopend: Score Service reageert niet of is offline!');
+    return { 
+        status: 503, 
+        data: { error: 'De score-berekening is momenteel niet beschikbaar wegens onderhoud. Probeer het later opnieuw.' } 
+    };
 });
 
 // Gebruik in je route
@@ -304,14 +307,21 @@ app.delete('/target/goals/:targetId', async (req, res) => {
 
 // --- NIEUWE ROUTE STAAT NU HIER (RUIM VOOR DE SERVER START) ---
 app.post('/target/analyze-photo', async (req, res) => {
-    const result = await breaker.fire(req.body);
+    try {
+        // We vuren het verzoek af via de circuit breaker
+        const result = await breaker.fire(req.body);
 
-// Zorg dat als de score-service een foutstatus zoals 404 teruggeeft, we die status en data doorgeven:
-    if (result.status && result.status !== 200) {
-        return res.status(result.status).json(result.data);
+        // Als de score-service een fout (zoals 404) of de fallback (503) teruggeeft, sturen we die door
+        if (result.status && result.status !== 200) {
+            return res.status(result.status).json(result.data);
+        }
+
+        // Succes! Geef de berekende score data terug aan de gebruiker
+        return res.json(result.data);
+    } catch (error) {
+        logger.error('Unhandled error in target analyze-photo endpoint:', error);
+        res.status(500).json({ error: 'Internal server error in target-service' });
     }
-
-    return res.json(result.data);
 });
 
 // Get target progress/statistics
