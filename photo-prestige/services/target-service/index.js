@@ -41,50 +41,28 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 3003; // We zetten deze nu ook hard op 3003 zodat het synchroon loopt met je logs!
 
-const CircuitBreaker = require('opossum');
-const axios = require('axios'); 
-
 // ==================== CIRCUIT BREAKER CONFIG ====================
 
-// 1. De functie die de score-service aanroept op de JUISTE route
+const createBreaker = require('./shared/circuitBreaker'); // Pad aanpassen naar waar je bestand staat
+const axios = require('axios');
+
+// 1. Definieer de specifieke call voor deze service
 const callScoreService = async (data) => {
-    try {
-        console.log("--- Breaker probeert NU verbinding te maken met score-service ---");
-        
-        const response = await axios.post('http://score-service:3006/scores/calculate', data, {
-            // FIX: Accepteer status 200 t/m 499 als geldig antwoord, zodat 404 de breaker NIET triggert
-            validateStatus: function (status) {
-                return status >= 200 && status < 500; 
-            }
-        });
-        
-        console.log(`--- score-service gaf antwoord met status: ${response.status} ---`);
-        return response;
-    } catch (axiosError) {
-        console.log("--- HARDE CRASH / NETWERKFOUT BIJ VERBINDING MET SCORE-SERVICE ---");
-        console.error(axiosError.message);
-        throw axiosError; 
-    }
+    return await axios.post('http://score-service:3006/scores/calculate', data);
 };
 
-// 2. Instellingen voor de Circuit Breaker
-const breakerOptions = {
-    timeout: 5000,                
-    errorThresholdPercentage: 50, 
-    resetTimeout: 10000           
-};
+// 2. Initialiseer de breaker
+const breaker = createBreaker(callScoreService);
 
-// 3. Bouw de Circuit Breaker
-const breaker = new CircuitBreaker(callScoreService, breakerOptions);
-
-breaker.on('open', () => console.log('!!! CIRCUIT BREAKER STATUS: OPEN (BLOKKEERT VERKEER) !!!'));
-breaker.on('close', () => console.log('!!! CIRCUIT BREAKER STATUS: CLOSED (ALLES OK) !!!'));
-breaker.on('halfOpen', () => console.log('!!! CIRCUIT BREAKER STATUS: HALF-OPEN (TESTING) !!!'));
-
-// 4. Fallback gedrag
+// 3. Fallback definiëren (specifiek per service)
 breaker.fallback((error) => {
-    logger.warn('Circuit Breaker fallback geactiveerd voor score-service');
-    return { data: { error: 'Score analyse service is momenteel onbereikbaar. Probeer het later opnieuw.' } };
+    return { data: { error: 'Service is momenteel niet beschikbaar.' } };
+});
+
+// Gebruik in je route
+app.post('/target/analyze-photo', async (req, res) => {
+    const result = await breaker.fire(req.body);
+    res.json(result.data);
 });
 
 // ==================== MIDDLEWARE ====================

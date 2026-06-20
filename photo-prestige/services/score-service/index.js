@@ -81,6 +81,33 @@ const publishEvent = async (eventName, data) => {
     }
 };
 
+// ==================== CIRCUIT BREAKER CONFIG ====================
+
+const createBreaker = require('./shared/circuitBreaker'); // Pad aanpassen naar waar je bestand staat
+const axios = require('axios');
+
+// 1. Definieer de specifieke call voor deze service
+const callScoreService = async (data) => {
+    return await axios.post('http://target-service:3005/target/analyze-photo', {
+        submissionId: data.submissionId
+    });
+};
+
+// 2. Initialiseer de breaker
+const breaker = createBreaker(callScoreService);
+
+// 3. Fallback definiëren (specifiek per service)
+breaker.fallback((error) => {
+    return { data: { error: 'Service is momenteel niet beschikbaar.' } };
+});
+
+// Gebruik in je route
+app.post('/target/analyze-photo', async (req, res) => {
+    const result = await breaker.fire(req.body);
+    res.json(result.data);
+});
+
+
 // ==================== ROUTES ====================
 
 app.get('/score/health', (req, res) => {
