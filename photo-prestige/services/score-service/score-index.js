@@ -220,7 +220,7 @@ app.post('/scores/calculate', async (req, res) => {
                 competitionId,
                 submissionId,
                 submissionId, // We mappen submissionId naar photo_id zodat deze niet meer NULL is!
-                submission.participant_id,
+                submission.user_id,
                 processedResults.similarity_percentage,
                 processedResults.distance_score,
                 finalScore,
