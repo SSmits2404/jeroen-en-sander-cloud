@@ -9,6 +9,7 @@ const { Pool } = require('pg');
 const winston = require('winston');
 const createBreaker = require('./shared/circuitBreaker'); 
 const axios = require('axios');
+const client = require('prom-client');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -20,33 +21,45 @@ const logger = winston.createLogger({
 });
 
 const app = express();
+const PORT = process.env.PORT || 3003;
 
-const client = require('prom-client');
+// ==================== GLOBAL MIDDLEWARE (EERST!) ====================
+app.use(helmet());
+app.use(cors());
+app.use(express.json({ limit: '50mb' })); // Nu staat hij veilig bovenaan voor ALLE routes!
+
+// Custom request logger voor debugging in de console
+app.use((req, res, next) => {
+    console.log("TARGET HIT:", req.method, req.url);
+    next();
+});
 
 // Verzamel standaard Node.js/V8 metrics (CPU, geheugen, etc.)
 client.collectDefaultMetrics({ register: client.register });
 
-app.use((req, res, next) => {
-  console.log("TARGET HIT:", req.method, req.url);
-  next();
-});
-
 // Custom counter om het aantal request te meten voor je dashboard
 const httpRequestsTotal = new client.Counter({
-  name: 'target_service_http_requests_total',
-  help: 'Totaal aantal HTTP requests naar de Target Service',
-  labelNames: ['method', 'route', 'status_code']
+    name: 'target_service_http_requests_total',
+    help: 'Totaal aantal HTTP requests naar de Target Service',
+    labelNames: ['method', 'route', 'status_code']
 });
 
 // Middleware om elke request automatisch te tellen
 app.use((req, res, next) => {
-  res.on('finish', () => {
-    httpRequestsTotal.labels(req.method, req.route ? req.route.path : req.path, res.statusCode).inc();
-  });
-  next();
+    res.on('finish', () => {
+        httpRequestsTotal.labels(req.method, req.route ? req.route.path : req.path, res.statusCode).inc();
+    });
+    next();
 });
 
-const PORT = process.env.PORT || 3003; // We zetten deze nu ook hard op 3003 zodat het synchroon loopt met je logs!
+app.use(morgan('combined', { stream: { write: message => logger.info(message) } }));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 900000,
+    max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100
+});
+app.use('/target/', limiter);
 
 // ==================== CIRCUIT BREAKER CONFIG ====================
 
@@ -66,25 +79,6 @@ breaker.fallback((error) => {
         data: { error: 'De score-berekening is momenteel niet beschikbaar wegens onderhoud. Probeer het later opnieuw.' } 
     };
 });
-
-// Gebruik in je route
-app.post('/target/analyze-photo', async (req, res) => {
-    const result = await breaker.fire(req.body);
-    res.json(result.data);
-});
-
-// ==================== MIDDLEWARE ====================
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
-app.use(morgan('combined', { stream: { write: message => logger.info(message) } }));
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 900000,
-    max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100
-});
-app.use('/target/', limiter);
 
 // Database verbinding
 const pool = new Pool({
@@ -133,6 +127,25 @@ app.get('/target/health', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'target-service', timestamp: new Date() });
+});
+
+// Analyze photo route (Verplaatst naar de juiste plek en uniek gemaakt!)
+app.post('/target/analyze-photo', async (req, res) => {
+    try {
+        // We vuren het verzoek af via de circuit breaker met de NU gevulde req.body
+        const result = await breaker.fire(req.body);
+
+        // Als de score-service een fout (zoals 404/400) of de fallback (503) teruggeeft, sturen we die door
+        if (result.status && result.status !== 200) {
+            return res.status(result.status).json(result.data);
+        }
+
+        // Succes! Geef de berekende score data terug aan de gebruiker
+        return res.json(result.data);
+    } catch (error) {
+        logger.error('Unhandled error in target analyze-photo endpoint:', error);
+        res.status(500).json({ error: 'Internal server error in target-service' });
+    }
 });
 
 // Create a new target/goal
@@ -310,25 +323,6 @@ app.delete('/target/goals/:targetId', async (req, res) => {
     }
 });
 
-// --- NIEUWE ROUTE STAAT NU HIER (RUIM VOOR DE SERVER START) ---
-app.post('/target/analyze-photo', async (req, res) => {
-    try {
-        // We vuren het verzoek af via de circuit breaker
-        const result = await breaker.fire(req.body);
-
-        // Als de score-service een fout (zoals 404) of de fallback (503) teruggeeft, sturen we die door
-        if (result.status && result.status !== 200) {
-            return res.status(result.status).json(result.data);
-        }
-
-        // Succes! Geef de berekende score data terug aan de gebruiker
-        return res.json(result.data);
-    } catch (error) {
-        logger.error('Unhandled error in target analyze-photo endpoint:', error);
-        res.status(500).json({ error: 'Internal server error in target-service' });
-    }
-});
-
 // Get target progress/statistics
 app.get('/target/goals/:targetId/progress', async (req, res) => {
     try {
@@ -363,21 +357,22 @@ app.get('/target/goals/:targetId/progress', async (req, res) => {
 
 // Prometheus scrape endpoint
 app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', client.register.contentType);
-  res.end(await client.register.metrics());
+    res.set('Content-Type', client.register.contentType);
+    res.end(await client.register.metrics());
 });
 
-// Error handling middleware
+// Protected dummy endpoint
+app.get("/protected", (req, res) => {
+    res.json({
+        message: "Access granted",
+        user: req.headers["x-user"]
+    });
+});
+
+// Global Error handling middleware
 app.use((err, req, res, next) => {
     logger.error('Unhandled error in target-service:', err);
     res.status(500).json({ error: 'Internal server error' });
-});
-
-app.get("/protected", (req, res) => {
-  res.json({
-    message: "Access granted",
-    user: req.headers["x-user"] // or gateway injected user
-  });
 });
 
 // Start server
