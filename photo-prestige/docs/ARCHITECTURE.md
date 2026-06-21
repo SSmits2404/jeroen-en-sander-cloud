@@ -8,17 +8,17 @@ Photo Prestige is a distributed microservices application designed for scalabili
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         CLIENT LAYER                             │
-│  (Mobile/Web via Postman/Insomnia for testing)                   │
+│                         CLIENT LAYER                            │
+│  (Mobile/Web via Postman/Insomnia for testing)                  │
 └──────────────────┬──────────────────────────────────────────────┘
                    │ HTTP/REST
 ┌──────────────────▼──────────────────────────────────────────────┐
-│                    API GATEWAY PATTERN                           │
-│        (Can be implemented with Kong, Express, Nginx)            │
+│                    API GATEWAY PATTERN                          │
+│        (Can be implemented with Kong, Express, Nginx)           │
 ├──────────────────┬──────────────────────────────────────────────┤
-│                  │                                                │
-│    Routing      │ Rate Limiting    │ Authentication              │
-│    Load Bal.    │ Caching          │ CORS                        │
+│                  │                                              │
+│    Routing       │ Rate Limiting    │ Authentication            │
+│    Load Bal.     │ Caching          │ CORS                      │
 └──────────────────┼──────────────────────────────────────────────┘
                    │
         ┌──────────┼──────────┬──────────┬──────────┐
@@ -45,13 +45,13 @@ Photo Prestige is a distributed microservices application designed for scalabili
    │    PostgreSQL Database (Central)      │  │  Mail  │ │  Read  │
    │                                       │  │Service │ │Service │
    │  ┌─────────────────────────────────┐  │  └────────┘ └────────┘
-   │  │ - users                          │  │
-   │  │ - competitions                   │  │ External Services
-   │  │ - submissions                    │  │ ├─ Imagga API (scoring)
-   │  │ - scores                         │  │ ├─ SMTP (email)
-   │  │ - imagga_index_mappings          │  │ ├─ Cloud Storage (optional)
-   │  │ - audit_logs                     │  │
-   │  │ - notifications                  │  │
+   │  │ - users                         │  │
+   │  │ - competitions                  │  │ External Services
+   │  │ - submissions                   │  │ ├─ Imagga API (scoring)
+   │  │ - scores                        │  │ ├─ SMTP (email)
+   │  │ - imagga_index_mappings         │  │ ├─ Cloud Storage (optional)
+   │  │ - audit_logs                    │  │
+   │  │ - notifications                 │  │
    │  └─────────────────────────────────┘  │
    └───────────────────────────────────────┘
 ```
