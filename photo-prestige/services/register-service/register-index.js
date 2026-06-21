@@ -117,12 +117,13 @@ app.get('/health', (req, res) => {
 // Register/Upload a new photo
 app.post('/register/photo', upload.single('photo'), async (req, res) => {
     try {
-        const { userId, title, description, tags } = req.body;
+        const { userId, participant_id, title, description, tags } = req.body;
 
-        if (!userId || !req.file) {
-            // Verwijder geüpload bestand als invoer incompleet is
+        const resolvedParticipantId = participant_id || userId;
+
+        if (!resolvedParticipantId || !req.file) {
             if (req.file) fs.unlinkSync(req.file.path);
-            return res.status(400).json({ error: 'Missing required fields: userId and photo file' });
+            return res.status(400).json({ error: 'Missing required fields: userId/participant_id and photo file' });
         }
 
         if (!title || title.trim() === '') {
@@ -130,33 +131,54 @@ app.post('/register/photo', upload.single('photo'), async (req, res) => {
             return res.status(400).json({ error: 'Photo title is required' });
         }
 
-        // Controleer of de user bestaat om database foreign key crashes te voorkomen
-        const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+        const userCheck = await pool.query(
+            'SELECT id FROM users WHERE id = $1',
+            [resolvedParticipantId]
+        );
+
         if (userCheck.rows.length === 0) {
             if (req.file) fs.unlinkSync(req.file.path);
             return res.status(404).json({ error: 'Target user does not exist' });
         }
 
-        // Insert photo record
         const result = await pool.query(
-            `INSERT INTO photos (user_id, title, description, image_url, file_path, tags, status, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
-             RETURNING id, user_id, title, description, image_url, created_at`,
-            [userId, title.trim(), description || null, req.file.filename, req.file.path, tags || null, 'pending']
+            `INSERT INTO photos (
+                user_id,
+                participant_id,
+                title,
+                description,
+                image_url,
+                file_path,
+                tags,
+                status,
+                created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+            RETURNING id, user_id, participant_id, title, description, image_url, created_at`,
+            [
+                resolvedParticipantId,   // user_id
+                resolvedParticipantId,   // participant_id (critical fix)
+                title.trim(),
+                description || null,
+                req.file.filename,
+                req.file.path,
+                tags || null,
+                'pending'
+            ]
         );
 
         const photo = result.rows[0];
 
-        // Publish event for processing
         await publishEvent('photo.registered', {
             photoId: photo.id,
             userId: photo.user_id,
+            participant_id: photo.participant_id,
             filename: req.file.filename,
             title: photo.title,
             timestamp: new Date()
         });
 
-        logger.info(`Photo registered: ${photo.id} by user ${userId}`);
+        logger.info(`Photo registered: ${photo.id} by user ${resolvedParticipantId}`);
 
         res.status(201).json({
             message: 'Photo registered successfully',

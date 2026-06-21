@@ -201,6 +201,12 @@ app.post('/scores/calculate', async (req, res) => {
         }
 
         const submission = submResult.rows[0];
+        const userResult = await pool.query(
+            `SELECT * FROM users WHERE id = $1`,
+            [submission.participant_id]
+        ); 
+
+        const email = userResult.rows[0]?.email || null;
 
         // Gecorrigeerde tijdsberekening (gebruikt nu deadline en created_at conform target-service!)
         const competitionDurationMs = new Date(competition.deadline) - new Date(competition.created_at);
@@ -237,6 +243,7 @@ app.post('/scores/calculate', async (req, res) => {
             [submissionId]
         );
 
+        logger.info(`added userId: ${submission.participant_id} to score record, and email: ${email}`);
         // Geoptimaliseerde eventnaam: we gebruiken 'score.calculated' (is logischer voor een nieuwe berekening)
         await publishEvent('score.calculated', {
             scoreId: score.id,
@@ -244,6 +251,10 @@ app.post('/scores/calculate', async (req, res) => {
             photoId: submissionId,
             competitionId,
             score: score.final_score,
+
+            userId: submission.participant_id,
+            email: email,
+
             timestamp: new Date()
         });
 

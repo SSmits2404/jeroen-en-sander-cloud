@@ -52,6 +52,21 @@ app.use(
 );
 
 app.use(
+  "/register/photo",
+  authenticate,
+  createProxyMiddleware({
+    target: "http://register-service:3002",
+    changeOrigin: true,
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader("x-user-id", req.user.userId);
+        proxyReq.setHeader("x-user-role", req.user.role);
+      }
+    }
+  })
+);
+
+app.use(
   "/targets",
   authenticate,
   createProxyMiddleware({

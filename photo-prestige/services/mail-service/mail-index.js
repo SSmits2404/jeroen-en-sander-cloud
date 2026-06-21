@@ -27,33 +27,24 @@ app.use(morgan('combined', { stream: { write: message => logger.info(message) } 
 
 // Email transporter setup with fallback to log-only transport if credentials are missing
 let transporter;
-const smtpConfigured = process.env.EMAIL_USER && process.env.EMAIL_PASSWORD;
 
-if (smtpConfigured) {
-    transporter = nodemailer.createTransport({
-        service: process.env.EMAIL_SERVICE || 'gmail',
-        auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASSWORD
-        }
-    });
+const smtpHost = process.env.SMTP_HOST || "mailhog";
+const smtpPort = parseInt(process.env.SMTP_PORT || "1025");
 
-    transporter.verify((error, success) => {
-        if (error) {
-            logger.error('SMTP Transporter verification failed:', error);
-        } else {
-            logger.info('SMTP Transporter is ready to send emails');
-        }
-    });
-} else {
-    logger.warn('SMTP credentials missing in .env. Mail service will run in LOG-ONLY mode (simulating emails).');
-    transporter = {
-        sendMail: async (options) => {
-            logger.info(`[SIMULATED EMAIL] To: ${options.to} | Subject: ${options.subject} | Content: ${options.html ? 'HTML content' : options.text}`);
-            return { messageId: 'simulated-id' };
-        }
-    };
-}
+transporter = nodemailer.createTransport({
+    host: smtpHost,
+    port: smtpPort,
+    secure: false
+});
+
+// optional but useful
+transporter.verify((error) => {
+    if (error) {
+        logger.error("SMTP connection failed:", error);
+    } else {
+        logger.info(`SMTP ready (${smtpHost}:${smtpPort})`);
+    }
+});
 
 // RabbitMQ connection and subscription with auto-retry
 let channel;
@@ -118,7 +109,7 @@ const handleEmailEvent = async (event) => {
             case 'photo.registered': // Extra opvang voor registratie van foto's
                 await sendPhotoProcessedEmail(event);
                 break;
-            case 'score.updated':
+            case 'score.calculated':
                 await sendScoreNotification(event);
                 break;
             case 'mail.send':
@@ -202,8 +193,13 @@ const sendPhotoProcessedEmail = async (event) => {
 
 // Send score notification
 const sendScoreNotification = async (event) => {
-    const { email, score, threshold } = event;
-    const targetEmail = email || 'participant@photoprestige.com';
+    logger.info(`SCORE EMAIL EVENT RECEIVED: ${JSON.stringify(event)}`);
+    const targetEmail = event.email;
+
+    if (!targetEmail) {
+        logger.warn('Score email skipped: missing email');
+    return;
+}
     const finalScore = score || event.final_score || 0;
     
     const mailOptions = {
