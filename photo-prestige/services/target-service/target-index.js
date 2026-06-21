@@ -10,6 +10,7 @@ const winston = require('winston');
 const createBreaker = require('./shared/circuitBreaker'); 
 const axios = require('axios');
 const client = require('prom-client');
+const { v4: uuidv4 } = require('uuid');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -99,6 +100,8 @@ const handleEvent = async (msg) => {
         
         if (routingKey === 'score.calculated') {
             await handleScoreCalculated(content);
+        } else if (routingKey === 'target.deadline.reached') {
+            await handleTargetDeadlineReached(content); // <--- DEZE TOEVOEGEN!
         }
         
         channel.ack(msg);
@@ -128,6 +131,7 @@ const initRabbitMQ = async (retries = 5) => {
             // Maak een specifieke wachtrij aan voor de target-service en bind deze aan het score-event
             const q = await channel.assertQueue('target-service-queue', { durable: true });
             await channel.bindQueue(q.queue, 'photo-prestige', 'score.calculated');
+            await channel.bindQueue(q.queue, 'photo-prestige', 'target.deadline.reached'); // <--- DEZE TOEVOEGEN!
             
             // Start met consumeren
             channel.consume(q.queue, handleEvent);
@@ -154,6 +158,29 @@ const publishEvent = async (eventName, data) => {
         );
     } catch (error) {
         logger.error('Event publish failed in target-service:', error);
+    }
+};
+
+// Nieuwe handler toevoegen in target-service:
+const handleTargetDeadlineReached = async (eventData) => {
+    const { targetId } = eventData;
+    try {
+        logger.info(`[AMQP] Target deadline bereikt voor ${targetId}. Status bijwerken in DB...`);
+        
+        // Update de status naar 'expired' als de doelen nog niet handmatig gehaald waren
+        const result = await pool.query(
+            `UPDATE targets 
+             SET status = 'expired', updated_at = CURRENT_TIMESTAMP 
+             WHERE id = $1 AND status = 'active'
+             RETURNING id, title, status`,
+            [targetId]
+        );
+
+        if (result.rowCount > 0) {
+            logger.info(`[AMQP] Target ${targetId} succesvol op 'expired' gezet.`);
+        }
+    } catch (error) {
+        logger.error(`[AMQP] Fout bij verwerken van deadline reached voor target ${targetId}:`, error);
     }
 };
 // ==================== ROUTES ====================
@@ -188,33 +215,41 @@ app.post('/target/analyze-photo', async (req, res) => {
 
 // Create a new target/goal
 app.post('/target/goals', async (req, res) => {
+    const client = await pool.connect();
     try {
         const { userId, title, description, targetScore, targetPhotoCount, deadline } = req.body;
-        if (!userId || !title) {
-            return res.status(400).json({ error: 'Missing required fields: userId and title' });
-        }
-        const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
-        if (userCheck.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        const result = await pool.query(
-            `INSERT INTO targets (user_id, title, description, target_score, target_photo_count, deadline, status, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
-             RETURNING id, user_id, title, description, target_score, target_photo_count, deadline, status, created_at`,
-            [userId, title.trim(), description || null, targetScore || null, targetPhotoCount || null, deadline || null, 'active']
+        const newTargetId = uuidv4();
+        
+        await client.query('BEGIN');
+        
+        // 1. ZET DE TRIGGER TIJDELIJK UIT voor deze sessie (alleen in de huidige transactie)
+        await client.query('SET LOCAL session_replication_role = replica');
+
+        // 2. Insert de target
+        const result = await client.query(
+            `INSERT INTO targets (id, user_id, title, description, target_score, target_photo_count, deadline, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP) RETURNING *`,
+            [newTargetId, userId, title.trim(), description || null, targetScore || null, targetPhotoCount || null, deadline || null, 'active']
         );
+
+        // 3. Voeg de participant handmatig toe (omdat we de trigger hebben uitgezet)
+        await client.query(
+            `INSERT INTO competition_participants (competition_id, participant_id, status) VALUES ($1, $2, 'active')`,
+            [newTargetId, userId]
+        );
+
+        await client.query('COMMIT');
+
         const goal = result.rows[0];
-        await publishEvent('target.created', {
-            targetId: goal.id,
-            userId: goal.user_id,
-            title: goal.title,
-            timestamp: new Date()
-        });
-        logger.info(`Target created: ${goal.id} for user ${userId}`);
+        await publishEvent('target.created', { targetId: goal.id, userId: goal.user_id, title: goal.title, timestamp: new Date() });
+        
         res.status(201).json({ message: 'Target created successfully', target: goal });
     } catch (error) {
-        logger.error('Target creation error:', error);
-        res.status(500).json({ error: 'Failed to create target' });
+        await client.query('ROLLBACK');
+        logger.error('Database transaction error:', error);
+        res.status(500).json({ error: 'Failed to create target', details: error.message });
+    } finally {
+        client.release();
     }
 });
 
