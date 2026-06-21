@@ -2,10 +2,10 @@
   "name": "read-service",
   "version": "1.0.0",
   "description": "Read Query Service (CQRS pattern) for Photo Prestige",
-  "main": "index.js",
+  "main": "read-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node read-index.js",
+    "dev": "nodemon read-index.js"
   },
   "dependencies": {
     "amqplib": "^0.10.4",

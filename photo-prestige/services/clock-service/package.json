@@ -2,10 +2,10 @@
   "name": "clock-service",
   "version": "1.0.0",
   "description": "Timer & Deadline Management microservice for Photo Prestige",
-  "main": "index.js",
+  "main": "clock-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node clock-index.js",
+    "dev": "nodemon clock-index.js"
   },
   "dependencies": {
     "amqplib": "^0.10.3",

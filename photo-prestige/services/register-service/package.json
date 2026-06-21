@@ -2,10 +2,10 @@
   "name": "register-service",
   "version": "1.0.0",
   "description": "User Registration & Profile microservice for Photo Prestige",
-  "main": "index.js",
+  "main": "register-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node register-index.js",
+    "dev": "nodemon register-index.js"
   },
   "dependencies": {
     "amqplib": "^0.10.3",
