@@ -27,26 +27,43 @@ app.use(morgan('combined', { stream: { write: message => logger.info(message) } 
 
 // Email transporter setup with fallback to log-only transport if credentials are missing
 let transporter;
-const smtpConfigured = process.env.EMAIL_USER && process.env.EMAIL_PASSWORD;
+
+// We zijn geconfigureerd als er óf een SMTP_HOST (Mailhog) is, óf oude EMAIL-credentials
+const smtpConfigured = process.env.SMTP_HOST || (process.env.EMAIL_USER && process.env.EMAIL_PASSWORD);
 
 if (smtpConfigured) {
-    transporter = nodemailer.createTransport({
-        service: process.env.EMAIL_SERVICE || 'gmail',
-        auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASSWORD
-        }
-    });
+    if (process.env.SMTP_HOST) {
+        // MODO: Mailhog / Lokale Docker SMTP configuratie
+        logger.info(`Connecting to local SMTP server at ${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 1025}`);
+        transporter = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: parseInt(process.env.SMTP_PORT) || 1025,
+            secure: false, // Mailhog gebruikt lokaal geen SSL/TLS
+            auth: process.env.SMTP_USER ? {
+                user: process.env.SMTP_USER,
+                pass: process.env.SMTP_PASS
+            } : undefined // Geen auth meesturen als de velden leeg zijn (zoals bij Mailhog)
+        });
+    } else {
+        // Fallback: Sander's originele Gmail cloud configuratie
+        transporter = nodemailer.createTransport({
+            service: process.env.EMAIL_SERVICE || 'gmail',
+            auth: {
+                user: process.env.EMAIL_USER,
+                pass: process.env.EMAIL_PASSWORD
+            }
+        });
+    }
 
     transporter.verify((error, success) => {
         if (error) {
             logger.error('SMTP Transporter verification failed:', error);
         } else {
-            logger.info('SMTP Transporter is ready to send emails');
+            logger.info('SMTP Transporter is ready and connected to Mailhog!');
         }
     });
 } else {
-    logger.warn('SMTP credentials missing in .env. Mail service will run in LOG-ONLY mode (simulating emails).');
+    logger.warn('SMTP configuration missing. Mail service will run in LOG-ONLY mode (simulating emails).');
     transporter = {
         sendMail: async (options) => {
             logger.info(`[SIMULATED EMAIL] To: ${options.to} | Subject: ${options.subject} | Content: ${options.html ? 'HTML content' : options.text}`);
@@ -118,6 +135,7 @@ const handleEmailEvent = async (event) => {
             case 'photo.registered': // Extra opvang voor registratie van foto's
                 await sendPhotoProcessedEmail(event);
                 break;
+            case 'score.calculated':
             case 'score.updated':
                 await sendScoreNotification(event);
                 break;
