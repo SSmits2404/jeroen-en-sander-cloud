@@ -2,10 +2,10 @@
   "name": "mail-service",
   "version": "1.0.0",
   "description": "Mail & Notifications microservice for Photo Prestige",
-  "main": "index.js",
+  "main": "mail-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node mail-index.js",
+    "dev": "nodemon mail-index.js"
   },
   "dependencies": {
     "express": "^4.18.2",

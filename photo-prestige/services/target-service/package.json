@@ -2,10 +2,10 @@
   "name": "target-service",
   "version": "1.0.0",
   "description": "Target Upload & Management microservice for Photo Prestige",
-  "main": "index.js",
+  "main": "target-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node target-index.js",
+    "dev": "nodemon target-index.js",
     "test": "jest"
   },
   "dependencies": {

@@ -2,10 +2,10 @@
   "name": "auth-service",
   "version": "1.0.0",
   "description": "Authentication & Authorization microservice for Photo Prestige",
-  "main": "index.js",
+  "main": "auth-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node auth-index.js",
+    "dev": "nodemon auth-index.js",
     "test": "jest --coverage",
     "lint": "eslint .",
     "migration:run": "node migrations/runner.js"

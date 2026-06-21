@@ -7,6 +7,9 @@ const morgan = require('morgan');
 const amqp = require('amqplib');
 const { Pool } = require('pg');
 const winston = require('winston');
+const createBreaker = require('./shared/circuitBreaker'); 
+const axios = require('axios');
+const client = require('prom-client');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -18,84 +21,37 @@ const logger = winston.createLogger({
 });
 
 const app = express();
+const PORT = process.env.PORT || 3003;
 
-const client = require('prom-client');
+// ==================== GLOBAL MIDDLEWARE (EERST!) ====================
+app.use(helmet());
+app.use(cors());
+app.use(express.json({ limit: '50mb' })); // Nu staat hij veilig bovenaan voor ALLE routes!
+
+// Custom request logger voor debugging in de console
+app.use((req, res, next) => {
+    console.log("TARGET HIT:", req.method, req.url);
+    next();
+});
 
 // Verzamel standaard Node.js/V8 metrics (CPU, geheugen, etc.)
 client.collectDefaultMetrics({ register: client.register });
 
-app.use((req, res, next) => {
-  console.log("TARGET HIT:", req.method, req.url);
-  next();
-});
-
 // Custom counter om het aantal request te meten voor je dashboard
 const httpRequestsTotal = new client.Counter({
-  name: 'target_service_http_requests_total',
-  help: 'Totaal aantal HTTP requests naar de Target Service',
-  labelNames: ['method', 'route', 'status_code']
+    name: 'target_service_http_requests_total',
+    help: 'Totaal aantal HTTP requests naar de Target Service',
+    labelNames: ['method', 'route', 'status_code']
 });
 
 // Middleware om elke request automatisch te tellen
 app.use((req, res, next) => {
-  res.on('finish', () => {
-    httpRequestsTotal.labels(req.method, req.route ? req.route.path : req.path, res.statusCode).inc();
-  });
-  next();
+    res.on('finish', () => {
+        httpRequestsTotal.labels(req.method, req.route ? req.route.path : req.path, res.statusCode).inc();
+    });
+    next();
 });
 
-const PORT = process.env.PORT || 3003; // We zetten deze nu ook hard op 3003 zodat het synchroon loopt met je logs!
-
-const CircuitBreaker = require('opossum');
-const axios = require('axios'); 
-
-// ==================== CIRCUIT BREAKER CONFIG ====================
-
-// 1. De functie die de score-service aanroept op de JUISTE route
-const callScoreService = async (data) => {
-    try {
-        console.log("--- Breaker probeert NU verbinding te maken met score-service ---");
-        
-        const response = await axios.post('http://score-service:3006/scores/calculate', data, {
-            // FIX: Accepteer status 200 t/m 499 als geldig antwoord, zodat 404 de breaker NIET triggert
-            validateStatus: function (status) {
-                return status >= 200 && status < 500; 
-            }
-        });
-        
-        console.log(`--- score-service gaf antwoord met status: ${response.status} ---`);
-        return response;
-    } catch (axiosError) {
-        console.log("--- HARDE CRASH / NETWERKFOUT BIJ VERBINDING MET SCORE-SERVICE ---");
-        console.error(axiosError.message);
-        throw axiosError; 
-    }
-};
-
-// 2. Instellingen voor de Circuit Breaker
-const breakerOptions = {
-    timeout: 5000,                
-    errorThresholdPercentage: 50, 
-    resetTimeout: 10000           
-};
-
-// 3. Bouw de Circuit Breaker
-const breaker = new CircuitBreaker(callScoreService, breakerOptions);
-
-breaker.on('open', () => console.log('!!! CIRCUIT BREAKER STATUS: OPEN (BLOKKEERT VERKEER) !!!'));
-breaker.on('close', () => console.log('!!! CIRCUIT BREAKER STATUS: CLOSED (ALLES OK) !!!'));
-breaker.on('halfOpen', () => console.log('!!! CIRCUIT BREAKER STATUS: HALF-OPEN (TESTING) !!!'));
-
-// 4. Fallback gedrag
-breaker.fallback((error) => {
-    logger.warn('Circuit Breaker fallback geactiveerd voor score-service');
-    return { data: { error: 'Score analyse service is momenteel onbereikbaar. Probeer het later opnieuw.' } };
-});
-
-// ==================== MIDDLEWARE ====================
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
 app.use(morgan('combined', { stream: { write: message => logger.info(message) } }));
 
 // Rate limiting
@@ -105,20 +61,78 @@ const limiter = rateLimit({
 });
 app.use('/target/', limiter);
 
+// ==================== CIRCUIT BREAKER CONFIG ====================
+
+// 1. Definieer de specifieke call voor deze service
+const callScoreService = async (data) => {
+    return await axios.post('http://score-service:3006/scores/calculate', data);
+};
+
+// 2. Initialiseer de breaker
+const breaker = createBreaker(callScoreService);
+
+// 3. Fallback definiëren (specifiek per service)
+breaker.fallback((error) => {
+    logger.warn('Circuit Breaker Geopend: Score Service reageert niet of is offline!');
+    return { 
+        status: 503, 
+        data: { error: 'De score-berekening is momenteel niet beschikbaar wegens onderhoud. Probeer het later opnieuw.' } 
+    };
+});
+
 // Database verbinding
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL
 });
 
 // RabbitMQ verbinding met automatische retry-lus
+// RabbitMQ verbinding met automatische retry-lus en consumer
 let channel;
+
+const handleEvent = async (msg) => {
+    if (!msg) return;
+    
+    try {
+        const content = JSON.parse(msg.content.toString());
+        const routingKey = msg.fields.routingKey;
+        logger.info(`[AMQP] Event ontvangen op key [${routingKey}]:`, content);
+        
+        if (routingKey === 'score.calculated') {
+            await handleScoreCalculated(content);
+        }
+        
+        channel.ack(msg);
+    } catch (error) {
+        logger.error('Event handling error in target-service:', error);
+        // Voorkom oneindige loops bij corrupte berichten
+        channel.nack(msg, false, false);
+    }
+};
+
+const handleScoreCalculated = async (scoreData) => {
+    logger.info(`[AMQP] Succesvol berekende score ontvangen voor photo ${scoreData.photoId}. Score: ${scoreData.score}`);
+    
+    // Optioneel: Hier kun je later logica toevoegen om automatisch de status van een target
+    // naar 'completed' te zetten als de score aan de eisen voldoet, in plaats van handmatig!
+    
+    return true;
+};
+
 const initRabbitMQ = async (retries = 5) => {
     while (retries) {
         try {
             const connection = await amqp.connect(process.env.RABBITMQ_URL);
             channel = await connection.createChannel();
             await channel.assertExchange('photo-prestige', 'topic', { durable: true });
-            logger.info('RabbitMQ connected (Target Service)');
+            
+            // Maak een specifieke wachtrij aan voor de target-service en bind deze aan het score-event
+            const q = await channel.assertQueue('target-service-queue', { durable: true });
+            await channel.bindQueue(q.queue, 'photo-prestige', 'score.calculated');
+            
+            // Start met consumeren
+            channel.consume(q.queue, handleEvent);
+            
+            logger.info('RabbitMQ connected and listening for scores (Target Service)');
             return;
         } catch (error) {
             logger.error(`RabbitMQ connection failed for Target Service. Retries left: ${retries - 1}`, error);
@@ -142,7 +156,6 @@ const publishEvent = async (eventName, data) => {
         logger.error('Event publish failed in target-service:', error);
     }
 };
-
 // ==================== ROUTES ====================
 
 // Health checks
@@ -152,6 +165,25 @@ app.get('/target/health', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'target-service', timestamp: new Date() });
+});
+
+// Analyze photo route (Verplaatst naar de juiste plek en uniek gemaakt!)
+app.post('/target/analyze-photo', async (req, res) => {
+    try {
+        // We vuren het verzoek af via de circuit breaker met de NU gevulde req.body
+        const result = await breaker.fire(req.body);
+
+        // Als de score-service een fout (zoals 404/400) of de fallback (503) teruggeeft, sturen we die door
+        if (result.status && result.status !== 200) {
+            return res.status(result.status).json(result.data);
+        }
+
+        // Succes! Geef de berekende score data terug aan de gebruiker
+        return res.json(result.data);
+    } catch (error) {
+        logger.error('Unhandled error in target analyze-photo endpoint:', error);
+        res.status(500).json({ error: 'Internal server error in target-service' });
+    }
 });
 
 // Create a new target/goal
@@ -207,27 +239,38 @@ app.get('/target/users/:userId/goals', async (req, res) => {
 });
 
 // Get a specific target
-app.get('/target/goals/:targetId', async (req, res) => {
+// Get target progress/statistics
+app.get('/target/goals/:targetId/progress', async (req, res) => {
     try {
         const { targetId } = req.params;
-        const result = await pool.query(`SELECT * FROM targets WHERE id = $1`, [targetId]);
-        if (result.rows.length === 0) {
+        const targetResult = await pool.query(`SELECT * FROM targets WHERE id = $1`, [targetId]);
+        if (targetResult.rows.length === 0) {
             return res.status(404).json({ error: 'Target not found' });
         }
-        const target = result.rows[0];
+        const target = targetResult.rows[0];
+        
+        // GECORRIGEERD: We filteren nu op s.competition_id of p.target_id in plaats van alle foto's van de user!
+        // (Pas de kolomnaam s.competition_id eventueel aan naar hoe hij exact in je photos/scores tabel staat)
         const progressResult = await pool.query(
             `SELECT 
                 COUNT(DISTINCT p.id)::int as photo_count,
-                COALESCE(AVG(s.final_score)::float, 0.0) as average_score
+                COALESCE(AVG(s.final_score)::float, 0.0) as average_score,
+                COALESCE(MAX(s.final_score)::float, 0.0) as highest_score,
+                COALESCE(MIN(s.final_score)::float, 0.0) as lowest_score
              FROM photos p
              LEFT JOIN scores s ON p.id = s.photo_id
-             WHERE p.user_id = $1`,
-            [target.user_id]
+             WHERE s.competition_id = $1`, 
+            [targetId] // <--- We filteren nu vlijmscherp op dit specifieke doel!
         );
-        res.json({ target: target, progress: progressResult.rows[0] });
+        const progress = progressResult.rows[0];
+        const completion = {
+            photoCount: target.target_photo_count ? Math.round((progress.photo_count / target.target_photo_count) * 100) : null,
+            averageScore: target.target_score && progress.average_score ? Math.round((progress.average_score / target.target_score) * 100) : (target.target_score ? 0 : null)
+        };
+        res.json({ target: target, progress: progress, completion: completion });
     } catch (error) {
-        logger.error('Fetch target error:', error);
-        res.status(500).json({ error: 'Failed to fetch target' });
+        logger.error('Progress fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch progress' });
     }
 });
 
@@ -329,18 +372,6 @@ app.delete('/target/goals/:targetId', async (req, res) => {
     }
 });
 
-// --- NIEUWE ROUTE STAAT NU HIER (RUIM VOOR DE SERVER START) ---
-app.post('/target/analyze-photo', async (req, res) => {
-    const result = await breaker.fire(req.body);
-
-// Zorg dat als de score-service een foutstatus zoals 404 teruggeeft, we die status en data doorgeven:
-    if (result.status && result.status !== 200) {
-        return res.status(result.status).json(result.data);
-    }
-
-    return res.json(result.data);
-});
-
 // Get target progress/statistics
 app.get('/target/goals/:targetId/progress', async (req, res) => {
     try {
@@ -375,21 +406,22 @@ app.get('/target/goals/:targetId/progress', async (req, res) => {
 
 // Prometheus scrape endpoint
 app.get('/metrics', async (req, res) => {
-  res.set('Content-Type', client.register.contentType);
-  res.end(await client.register.metrics());
+    res.set('Content-Type', client.register.contentType);
+    res.end(await client.register.metrics());
 });
 
-// Error handling middleware
+// Protected dummy endpoint
+app.get("/protected", (req, res) => {
+    res.json({
+        message: "Access granted",
+        user: req.headers["x-user"]
+    });
+});
+
+// Global Error handling middleware
 app.use((err, req, res, next) => {
     logger.error('Unhandled error in target-service:', err);
     res.status(500).json({ error: 'Internal server error' });
-});
-
-app.get("/protected", (req, res) => {
-  res.json({
-    message: "Access granted",
-    user: req.headers["x-user"] // or gateway injected user
-  });
 });
 
 // Start server

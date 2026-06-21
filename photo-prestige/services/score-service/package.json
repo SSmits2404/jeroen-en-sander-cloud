@@ -2,10 +2,10 @@
   "name": "score-service",
   "version": "1.0.0",
   "description": "Scoring & Imagga Integration microservice for Photo Prestige",
-  "main": "index.js",
+  "main": "score-index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node score-index.js",
+    "dev": "nodemon score-index.js",
     "test": "jest"
   },
   "dependencies": {
