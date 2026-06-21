@@ -111,6 +111,9 @@ services:
       - "3003:3003"
     volumes:
       - ./uploads:/app/uploads
+      - ./services/target-service:/app
+      - ./shared:/app/shared
+      - /app/node_modules
     depends_on:
       postgres:
         condition: service_healthy
