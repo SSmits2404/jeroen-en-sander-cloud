@@ -100,7 +100,8 @@ app.get('/clock/jobs', (req, res) => {
         jobs: [
             { name: 'hourly-cleanup', schedule: '0 * * * *', description: 'Cleanup expired sessions' },
             { name: 'daily-report', schedule: '0 2 * * *', description: 'Generate daily reports' },
-            { name: 'weekly-stats', schedule: '0 3 * * 0', description: 'Calculate weekly statistics' }
+            { name: 'weekly-stats', schedule: '0 3 * * 0', description: 'Calculate weekly statistics' },
+            { name: 'target-deadline-check', schedule: '* * * * *', description: 'Checks for targets that reached their deadline' }
         ]
     });
 });
@@ -220,6 +221,47 @@ cron.schedule('0 3 * * 0', async () => {
         logger.info('Weekly statistics calculated successfully');
     } catch (error) {
         logger.error('Weekly statistics calculation error:', error);
+    }
+});
+
+// Elke minuut controleren op verlopen target-deadlines (* * * * *)
+cron.schedule('* * * * *', async () => {
+    try {
+        logger.info('[CLOCK] Controleren op verlopen target-deadlines...');
+        
+        const hasTargets = await tableExists('targets');
+        if (!hasTargets) {
+            logger.warn('[CLOCK] Tabel "targets" bestaat nog niet. Overslaan.');
+            return;
+        }
+
+        // Haal alle actieve targets op die de deadline zijn gepasseerd
+        const expiredTargets = await pool.query(
+            `SELECT id, user_id, title, deadline 
+             FROM targets 
+             WHERE status = 'active' AND deadline <= CURRENT_TIMESTAMP`
+        );
+
+        if (expiredTargets.rows.length === 0) {
+            return; // Geen verlopen targets gevonden op dit moment
+        }
+
+        logger.info(`[CLOCK] ${expiredTargets.rows.length} verlopen target(s) gevonden! Events dispatchen...`);
+
+        for (const target of expiredTargets.rows) {
+            // Drop het event op de RabbitMQ Topic Exchange
+            await publishEvent('target.deadline.reached', {
+                targetId: target.id,
+                userId: target.user_id,
+                title: target.title,
+                deadline: target.deadline,
+                timestamp: new Date()
+            });
+            
+            logger.info(`[CLOCK] Event 'target.deadline.reached' verzonden voor target: ${target.id}`);
+        }
+    } catch (error) {
+        logger.error('[CLOCK] Fout tijdens het controleren van target-deadlines:', error);
     }
 });
 
