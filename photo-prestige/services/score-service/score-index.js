@@ -8,6 +8,10 @@ const amqp = require('amqplib');
 const winston = require('winston');
 const ImaggaClient = require('./imagga-client');
 const fs = require('fs');
+const client = require('prom-client'); // <--- Toevoegen bij de requires
+
+// Verzamel standaard Node.js/V8 metrics (CPU, geheugen, etc.)
+client.collectDefaultMetrics({ register: client.register });
 
 const logger = winston.createLogger({
     level: 'info',
@@ -125,9 +129,12 @@ app.get('/health', (req, res) => {
  * Calculate score for a submission
  * POST /scores/calculate
  */
+/**
+ * Calculate score for a submission
+ * POST /scores/calculate
+ */
 app.post('/scores/calculate', async (req, res) => {
     try {
-        // 🚨 DEBUG LOG: Laat exact zien wat er binnenkomt vanuit de target-service!
         console.log("🚨 [SCORE-SERVICE] ONTVANGEN PAYLOAD:", JSON.stringify(req.body, null, 2));
 
         const { competitionId, submissionId, targetImagePath, submissionImagePath } = req.body;
@@ -136,7 +143,7 @@ app.post('/scores/calculate', async (req, res) => {
             return res.status(400).json({ error: 'Missing required body fields' });
         }
 
-        // RETRIEVE: Haal competitie op uit de 'targets' tabel
+        // RETRIEVE: Haal competitie/target op uit de 'targets' tabel
         const compResult = await pool.query(
             `SELECT * FROM targets WHERE id = $1`,
             [competitionId]
@@ -164,7 +171,7 @@ app.post('/scores/calculate', async (req, res) => {
             return res.status(400).json({ error: 'Competition index not yet trained' });
         }
 
-        // Query similarity via Imagga Wrapper met een test fallback
+        // Query similarity via Imagga Wrapper
         let processedResults;
         try {
             const imaggaResults = await imagga.queryIndex(
@@ -195,23 +202,24 @@ app.post('/scores/calculate', async (req, res) => {
 
         const submission = submResult.rows[0];
 
-        // Calculate final score
-        const competitionDurationMs = new Date(competition.end_time) - new Date(competition.start_time);
-        const submissionTimeMs = new Date(submission.uploaded_at || new Date()) - new Date(competition.start_time);
+        // Gecorrigeerde tijdsberekening (gebruikt nu deadline en created_at conform target-service!)
+        const competitionDurationMs = new Date(competition.deadline) - new Date(competition.created_at);
+        const submissionTimeMs = new Date(submission.uploaded_at || new Date()) - new Date(competition.created_at);
         const timeRatio = Math.max(0, Math.min(1, submissionTimeMs / (competitionDurationMs || 1)));
         
         const finalScore = (1 - (timeRatio * 0.5)) * processedResults.similarity_percentage;
 
-        // Store score
+        // Gecorrigeerde query: we voegen nu ook photo_id toe aan de INSERT!
         const scoreResult = await pool.query(
             `INSERT INTO scores 
-             (competition_id, submission_id, participant_id, similarity_percentage, 
+             (competition_id, submission_id, photo_id, participant_id, similarity_percentage, 
               distance_score, final_score, matching_images, score_formula, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
              RETURNING *`,
             [
                 competitionId,
                 submissionId,
+                submissionId, // We mappen submissionId naar photo_id zodat deze niet meer NULL is!
                 submission.participant_id,
                 processedResults.similarity_percentage,
                 processedResults.distance_score,
@@ -229,14 +237,13 @@ app.post('/scores/calculate', async (req, res) => {
             [submissionId]
         );
 
-        // Publish event naar de bus
-        await publishEvent('score.updated', {
+        // Geoptimaliseerde eventnaam: we gebruiken 'score.calculated' (is logischer voor een nieuwe berekening)
+        await publishEvent('score.calculated', {
             scoreId: score.id,
             submissionId,
+            photoId: submissionId,
             competitionId,
             score: score.final_score,
-            threshold: 70,
-            email: submission.email || null,
             timestamp: new Date()
         });
 
@@ -343,6 +350,12 @@ app.post('/scores/train-index', async (req, res) => {
         logger.error('Train index error:', error);
         res.status(500).json({ error: 'Index training failed' });
     }
+});
+
+// Prometheus scrape endpoint voor score-service
+app.get('/metrics', async (req, res) => {
+    res.set('Content-Type', client.register.contentType);
+    res.end(await client.register.metrics());
 });
 
 // Global unhandled error middleware

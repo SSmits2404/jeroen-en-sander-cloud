@@ -86,14 +86,53 @@ const pool = new Pool({
 });
 
 // RabbitMQ verbinding met automatische retry-lus
+// RabbitMQ verbinding met automatische retry-lus en consumer
 let channel;
+
+const handleEvent = async (msg) => {
+    if (!msg) return;
+    
+    try {
+        const content = JSON.parse(msg.content.toString());
+        const routingKey = msg.fields.routingKey;
+        logger.info(`[AMQP] Event ontvangen op key [${routingKey}]:`, content);
+        
+        if (routingKey === 'score.calculated') {
+            await handleScoreCalculated(content);
+        }
+        
+        channel.ack(msg);
+    } catch (error) {
+        logger.error('Event handling error in target-service:', error);
+        // Voorkom oneindige loops bij corrupte berichten
+        channel.nack(msg, false, false);
+    }
+};
+
+const handleScoreCalculated = async (scoreData) => {
+    logger.info(`[AMQP] Succesvol berekende score ontvangen voor photo ${scoreData.photoId}. Score: ${scoreData.score}`);
+    
+    // Optioneel: Hier kun je later logica toevoegen om automatisch de status van een target
+    // naar 'completed' te zetten als de score aan de eisen voldoet, in plaats van handmatig!
+    
+    return true;
+};
+
 const initRabbitMQ = async (retries = 5) => {
     while (retries) {
         try {
             const connection = await amqp.connect(process.env.RABBITMQ_URL);
             channel = await connection.createChannel();
             await channel.assertExchange('photo-prestige', 'topic', { durable: true });
-            logger.info('RabbitMQ connected (Target Service)');
+            
+            // Maak een specifieke wachtrij aan voor de target-service en bind deze aan het score-event
+            const q = await channel.assertQueue('target-service-queue', { durable: true });
+            await channel.bindQueue(q.queue, 'photo-prestige', 'score.calculated');
+            
+            // Start met consumeren
+            channel.consume(q.queue, handleEvent);
+            
+            logger.info('RabbitMQ connected and listening for scores (Target Service)');
             return;
         } catch (error) {
             logger.error(`RabbitMQ connection failed for Target Service. Retries left: ${retries - 1}`, error);
@@ -117,7 +156,6 @@ const publishEvent = async (eventName, data) => {
         logger.error('Event publish failed in target-service:', error);
     }
 };
-
 // ==================== ROUTES ====================
 
 // Health checks
@@ -201,27 +239,38 @@ app.get('/target/users/:userId/goals', async (req, res) => {
 });
 
 // Get a specific target
-app.get('/target/goals/:targetId', async (req, res) => {
+// Get target progress/statistics
+app.get('/target/goals/:targetId/progress', async (req, res) => {
     try {
         const { targetId } = req.params;
-        const result = await pool.query(`SELECT * FROM targets WHERE id = $1`, [targetId]);
-        if (result.rows.length === 0) {
+        const targetResult = await pool.query(`SELECT * FROM targets WHERE id = $1`, [targetId]);
+        if (targetResult.rows.length === 0) {
             return res.status(404).json({ error: 'Target not found' });
         }
-        const target = result.rows[0];
+        const target = targetResult.rows[0];
+        
+        // GECORRIGEERD: We filteren nu op s.competition_id of p.target_id in plaats van alle foto's van de user!
+        // (Pas de kolomnaam s.competition_id eventueel aan naar hoe hij exact in je photos/scores tabel staat)
         const progressResult = await pool.query(
             `SELECT 
                 COUNT(DISTINCT p.id)::int as photo_count,
-                COALESCE(AVG(s.final_score)::float, 0.0) as average_score
+                COALESCE(AVG(s.final_score)::float, 0.0) as average_score,
+                COALESCE(MAX(s.final_score)::float, 0.0) as highest_score,
+                COALESCE(MIN(s.final_score)::float, 0.0) as lowest_score
              FROM photos p
              LEFT JOIN scores s ON p.id = s.photo_id
-             WHERE p.user_id = $1`,
-            [target.user_id]
+             WHERE s.competition_id = $1`, 
+            [targetId] // <--- We filteren nu vlijmscherp op dit specifieke doel!
         );
-        res.json({ target: target, progress: progressResult.rows[0] });
+        const progress = progressResult.rows[0];
+        const completion = {
+            photoCount: target.target_photo_count ? Math.round((progress.photo_count / target.target_photo_count) * 100) : null,
+            averageScore: target.target_score && progress.average_score ? Math.round((progress.average_score / target.target_score) * 100) : (target.target_score ? 0 : null)
+        };
+        res.json({ target: target, progress: progress, completion: completion });
     } catch (error) {
-        logger.error('Fetch target error:', error);
-        res.status(500).json({ error: 'Failed to fetch target' });
+        logger.error('Progress fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch progress' });
     }
 });
 
