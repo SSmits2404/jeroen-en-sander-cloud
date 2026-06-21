@@ -24,6 +24,11 @@ const client = require('prom-client');
 // Verzamel standaard Node.js/V8 metrics (CPU, geheugen, etc.)
 client.collectDefaultMetrics({ register: client.register });
 
+app.use((req, res, next) => {
+  console.log("TARGET HIT:", req.method, req.url);
+  next();
+});
+
 // Custom counter om het aantal request te meten voor je dashboard
 const httpRequestsTotal = new client.Counter({
   name: 'target_service_http_requests_total',
@@ -378,6 +383,13 @@ app.get('/metrics', async (req, res) => {
 app.use((err, req, res, next) => {
     logger.error('Unhandled error in target-service:', err);
     res.status(500).json({ error: 'Internal server error' });
+});
+
+app.get("/protected", (req, res) => {
+  res.json({
+    message: "Access granted",
+    user: req.headers["x-user"] // or gateway injected user
+  });
 });
 
 // Start server

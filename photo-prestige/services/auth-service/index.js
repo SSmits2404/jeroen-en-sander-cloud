@@ -81,16 +81,12 @@ const publishEvent = async (eventName, data) => {
 // ==================== ROUTES ====================
 
 // Health checks (Both for internal Docker orchestration and gateway routing)
-app.get('/auth/health', (req, res) => {
-    res.json({ status: 'OK', service: 'auth-service', timestamp: new Date() });
-});
-
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', service: 'auth-service', timestamp: new Date() });
 });
 
 // Register endpoint
-app.post('/auth/register', async (req, res) => {
+app.post('/register', async (req, res) => {
     try {
         const { username, email, password, firstName, lastName, role } = req.body;
 
@@ -133,7 +129,9 @@ app.post('/auth/register', async (req, res) => {
 });
 
 // Login endpoint
-app.post('/auth/login', async (req, res) => {
+app.post('/login', async (req, res) => {
+    console.log("LOGIN HANDLER REACHED");
+    console.log("JWT SECRET:", process.env.JWT_SECRET);
     try {
         const { email, password } = req.body;
 
@@ -194,7 +192,7 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // Verify token endpoint
-app.post('/auth/verify', async (req, res) => {
+app.post('/verify', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
 
@@ -211,7 +209,7 @@ app.post('/auth/verify', async (req, res) => {
 });
 
 // Refresh token endpoint
-app.post('/auth/refresh', (req, res) => {
+app.post('/refresh', (req, res) => {
     try {
         const { token } = req.body;
 

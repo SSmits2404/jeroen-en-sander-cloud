@@ -42,6 +42,16 @@ services:
       timeout: 5s
       retries: 5
 
+  api-gateway:
+    build: ./services/api-gateway
+    ports:
+      - "3080:3080"
+    environment:
+      - PORT=3080
+      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-key-change-in-production}
+    networks:
+      - photo-prestige-network
+
   # Auth Service
   auth-service:
     build:
@@ -261,6 +271,7 @@ services:
 
 networks:
   photo-prestige-network:
+    name: photo-prestige-network
     driver: bridge
 
 volumes:
